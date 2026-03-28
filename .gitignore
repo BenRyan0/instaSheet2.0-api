@@ -1,0 +1,13 @@
+/node_modules
+.env
+.vscode/*
+/credentials.json
+CLAUDE.md
+.claude/
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

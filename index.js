@@ -203,6 +203,33 @@ async function fetchLeadDataFromInstantly(leadEmail, instantlyApiKey) {
 }
 
 // =======================
+// Website Phone Lookup — http://localhost:8000/lookup
+// Returns the first N phone_numbers from the local scraper service.
+// Falls back gracefully on timeout or error — never blocks processing.
+// =======================
+async function fetchWebsitePhones(leadEmail) {
+  try {
+    console.log(`📞 Fetching website phones for: ${leadEmail}`);
+    const res = await axios.post(
+      'http://localhost:8000/lookup',
+      { email: leadEmail },
+      { timeout: 180000, headers: { 'Content-Type': 'application/json' } }
+    );
+
+    const phones = res.data?.phone_numbers || [];
+    if (res.data?.skipped) {
+      console.log(chalk.gray(`   [Phone Lookup] Skipped: ${res.data.skip_reason || 'unknown reason'}`));
+      return [];
+    }
+    console.log(chalk.gray(`   [Phone Lookup] Found ${phones.length} number(s)`));
+    return phones;
+  } catch (err) {
+    console.warn(chalk.yellow(`⚠️ Website phone lookup failed for ${leadEmail}: ${err.message}`));
+    return [];
+  }
+}
+
+// =======================
 // Step 1 — Analyze Reply Interest & Extract Eligibility Answers
 // =======================
 async function analyzeReplyEligibility(replyText, replySubject, campaignContext = {}, openaiClient) {
@@ -358,6 +385,7 @@ async function enrichLeadWithOpenAI(replyData, instantlyData, eligibilityAnalysi
     'Phone From Instantly':   'Instantly phone_number — format (XXX) XXX-XXXX, or blank',
     'Phone 2':                'Instantly additional_phones[0] — format (XXX) XXX-XXXX, or blank',
     'Phone 3':                'Instantly additional_phones[1] — format (XXX) XXX-XXXX, or blank',
+    'Phone 1':                'Leave blank — filled by website phone lookup after enrichment',
     'Overall Eligibility':    'eligibilityAnalysis.overallEligibility',
     'Reply Text':             'The COMPLETE reply_text_snippet — do NOT truncate',
     'Email Signature':        'Extract from reply: text after "Sincerely," / "Best," / "Thanks," / "Warm regards," or a name + phone block at the bottom',
@@ -465,6 +493,7 @@ function createFallbackLeadData(replyData, eligibilityAnalysis, instantlyData = 
     'Lead Email':             replyData.lead_email || '',
     'Phone From Reply':       eligibilityAnalysis?.phoneFromReply || '',
     'Phone From Instantly':   '',
+    'Phone 1':                '',
     'Phone 2':                '',
     'Phone 3':                '',
     'Overall Eligibility':    eligibilityAnalysis?.overallEligibility || 'Needs Verification',
@@ -698,8 +727,11 @@ async function processReply(reply) {
 
     console.log(chalk.green('✅ Lead engaged — proceeding with enrichment'));
 
-    // Step 3: Fetch from Instantly
-    const instantlyData = await fetchLeadDataFromInstantly(leadEmail, instantlyApiKey);
+    // Step 3: Fetch from Instantly + website phone lookup (in parallel)
+    const [instantlyData, websitePhones] = await Promise.all([
+      fetchLeadDataFromInstantly(leadEmail, instantlyApiKey),
+      fetchWebsitePhones(leadEmail),
+    ]);
 
     // Step 4: Enrich
     let enrichedData;
@@ -709,6 +741,11 @@ async function processReply(reply) {
       console.error(chalk.yellow('⚠️ OpenAI enrichment failed — using fallback data'));
       enrichedData = createFallbackLeadData(reply, eligibilityAnalysis, instantlyData, addressMapping, sheetHeaders);
     }
+
+    // Overwrite Phone 1/2/3 with website lookup results (always deterministic).
+    if (sheetHeaders.includes('Phone 1')) enrichedData['Phone 1'] = websitePhones[0]?.number || '';
+    if (sheetHeaders.includes('Phone 2')) enrichedData['Phone 2'] = websitePhones[1]?.number || '';
+    if (sheetHeaders.includes('Phone 3')) enrichedData['Phone 3'] = websitePhones[2]?.number || '';
 
     // Step 5: Race-condition duplicate guard
     if (isEmailInCache(sheetKey, leadEmail)) {

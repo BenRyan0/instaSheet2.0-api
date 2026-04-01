@@ -30,6 +30,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const SCHEDULER_INTERVAL_MINUTES = parseInt(process.env.SCHEDULER_INTERVAL_MINUTES) || 1;
 // Max tenants processed concurrently. 0 = unlimited (all tenants in parallel).
 const TENANT_CONCURRENCY_LIMIT = parseInt(process.env.TENANT_CONCURRENCY_LIMIT) || 0;
+const PHONE_LOOKUP_URL = process.env.PHONE_LOOKUP_URL || 'http://localhost:8000/lookup';
 
 if (!MONGODB_URI) {
   console.error(chalk.red('❌ Missing required environment variable: MONGODB_URI'));
@@ -211,7 +212,7 @@ async function fetchWebsitePhones(leadEmail) {
   try {
     console.log(`📞 Fetching website phones for: ${leadEmail}`);
     const res = await axios.post(
-      'http://localhost:8000/lookup',
+      PHONE_LOOKUP_URL,
       { email: leadEmail },
       { timeout: 180000, headers: { 'Content-Type': 'application/json' } }
     );

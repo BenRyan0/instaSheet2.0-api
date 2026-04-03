@@ -72,6 +72,29 @@ const CampaignTypeSchema = new mongoose.Schema({
     default: 'direct',
   },
 
+  // When enabled, the system sends an automated reply via Instantly after a
+  // lead is confirmed interested and written to the sheet.
+  // The subject/body templates are passed through OpenAI to fill in
+  // personalization placeholders (e.g. company name, first name).
+  autoReply: {
+    enabled: {
+      type: Boolean,
+      default: false,
+    },
+    subject: {
+      type: String,
+      default: '',
+    },
+    bodyHtml: {
+      type: String,
+      default: '',
+    },
+    bodyText: {
+      type: String,
+      default: '',
+    },
+  },
+
   isActive: {
     type: Boolean,
     default: true,

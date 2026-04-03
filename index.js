@@ -103,8 +103,53 @@ function addEmailToCache(sheetKey, email) {
 }
 
 // =======================
-// Rate Limiting
+// Instantly Rate Limiter — per API key, sliding window
+// Limits: 100 req/sec, 6000 req/min
 // =======================
+const INSTANTLY_LIMIT_PER_SEC = 100;
+const INSTANTLY_LIMIT_PER_MIN = 6000;
+
+// Map<apiKey, number[]> — timestamps (ms) of recent requests per key
+const instantlyRequestLog = new Map();
+
+async function awaitInstantlyRateLimit(apiKey) {
+  if (!instantlyRequestLog.has(apiKey)) instantlyRequestLog.set(apiKey, []);
+  const log = instantlyRequestLog.get(apiKey);
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const now = Date.now();
+
+    // Drop timestamps older than 60 seconds
+    const cutoffMin = now - 60_000;
+    const cutoffSec = now - 1_000;
+    while (log.length && log[0] < cutoffMin) log.shift();
+
+    const countLastSec = log.filter(t => t >= cutoffSec).length;
+    const countLastMin = log.length;
+
+    if (countLastSec < INSTANTLY_LIMIT_PER_SEC && countLastMin < INSTANTLY_LIMIT_PER_MIN) {
+      log.push(now);
+      return; // slot available — proceed immediately
+    }
+
+    // Calculate how long until the oldest blocking request falls out of its window
+    let waitMs = 10; // default poll interval
+    if (countLastSec >= INSTANTLY_LIMIT_PER_SEC) {
+      const oldestInSec = log.find(t => t >= cutoffSec);
+      if (oldestInSec !== undefined) waitMs = Math.max(waitMs, oldestInSec + 1_000 - now + 1);
+    }
+    if (countLastMin >= INSTANTLY_LIMIT_PER_MIN) {
+      const oldestInMin = log[0];
+      if (oldestInMin !== undefined) waitMs = Math.max(waitMs, oldestInMin + 60_000 - now + 1);
+    }
+
+    console.log(chalk.gray(`   [RateLimit] Instantly queue full (${countLastSec}/s, ${countLastMin}/min) — waiting ${waitMs}ms`));
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+}
+
+// Legacy single-key rate limit used for non-Instantly calls (Instantly send reply, etc.)
 const RATE_LIMIT_MS = 1000;
 let lastRequestTime = 0;
 
@@ -346,20 +391,32 @@ async function enrichLeadWithOpenAI(replyData, instantlyData, eligibilityAnalysi
   const sheetHeaders = campaignContext.sheetHeaders || [];
   const headerSet = new Set(sheetHeaders);
 
-  const instantlyContext = instantlyData ? {
-    first_name: instantlyData.first_name || instantlyData.payload?.firstName,
-    last_name: instantlyData.last_name || instantlyData.payload?.lastName,
-    phone_number: instantlyData.phone_number,
-    additional_phones: instantlyData.additional_phones,
-    address: instantlyData.address,
-    city: instantlyData.city,
-    state: instantlyData.state,
-    zip: instantlyData.zip,
-    raw_address_string: instantlyData.raw_address_string,
-    title: instantlyData.title,
-    linkedin: instantlyData.linkedin,
-  } : null;
+  const companyName = instantlyData.company_name || instantlyData['Company Name'] || instantlyData.companyName || instantlyData.CompanyName || instantlyData.company || instantlyData.Company || instantlyData['company name'] || instantlyData.payload?.company_name || instantlyData.payload?.['Company Name'] || instantlyData.payload?.companyName || instantlyData.payload?.CompanyName || instantlyData.payload?.company || instantlyData.payload?.Company || instantlyData.payload?.['company name'] || instantlyData.title || instantlyData.Title || instantlyData.payload?.title || instantlyData.payload?.Title || instantlyData['Company title'] || instantlyData['company title'] || instantlyData.companyTitle || instantlyData.CompanyTitle || instantlyData.company_title || instantlyData.payload?.['Company title'] || instantlyData.payload?.['company title'] || instantlyData.payload?.companyTitle || instantlyData.payload?.CompanyTitle || instantlyData.payload?.company_title || instantlyData.name || instantlyData.Name || instantlyData.payload?.name || instantlyData.payload?.Name || instantlyData['business name'] || instantlyData['Business Name'] || instantlyData.businessName || instantlyData.BusinessName || instantlyData.business_name || instantlyData.payload?.['business name'] || instantlyData.payload?.['Business Name'] || instantlyData.payload?.businessName || instantlyData.payload?.BusinessName || instantlyData.payload?.business_name || '';
 
+  // const instantlyContext = instantlyData ? {
+  //   first_name: instantlyData.first_name || instantlyData.payload?.firstName,
+  //   last_name: instantlyData.last_name || instantlyData.payload?.lastName,
+  //   phone_number: instantlyData.phone_number,
+  //   additional_phones: instantlyData.additional_phones,
+  //   address: instantlyData.address || instantlyData.payload?.address || instantlyData.payload?.Address,
+  //   city: instantlyData.city,
+  //   state: instantlyData.state,
+  //   zip: instantlyData.zip,
+  //   raw_address_string: instantlyData.raw_address_string,
+  //   title: instantlyData.title,
+  //   linkedin: instantlyData.linkedin,
+  //   company_name: companyName,
+  // } : null;
+
+  // DYNAMIC
+  const instantlyContext = instantlyData?.payload
+  ? Object.fromEntries(
+      Object.entries(instantlyData.payload).map(([key, value]) => [
+        key.toLowerCase().replace(/\s+/g, '_'),
+        value,
+      ])
+    )
+  : null;
   // Address field instructions — shared across the 4 location headers.
   const addrNote = addressMapping === 'skip'
     ? 'Leave blank — address population is disabled for this campaign.'
@@ -634,9 +691,175 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
 }
 
 // =======================
+// Auto-Reply — Personalize template via OpenAI
+// Replaces placeholders in the campaign's reply script (company name, first
+// name, etc.) using data already collected from Instantly and the reply.
+// =======================
+function plainTextToHtml(text) {
+  if (!text) return '';
+  return text
+    .split(/\n\n+/)
+    .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
+    .join('\n');
+}
+
+// Cache: Map<`${apiKey}:${email}`, string> — avoids refetching the same account
+const sendingAccountNameCache = new Map();
+
+async function fetchSendingAccountName(emailAccount, instantlyApiKey) {
+  if (!emailAccount) return '';
+  const cacheKey = `${instantlyApiKey}:${emailAccount}`;
+  if (sendingAccountNameCache.has(cacheKey)) {
+    console.log(chalk.gray(`   [Sending Account] Cache hit for ${emailAccount}`));
+    return sendingAccountNameCache.get(cacheKey);
+  }
+
+  try {
+    await awaitInstantlyRateLimit(instantlyApiKey);
+    const res = await axios.get(
+      `https://api.instantly.ai/api/v2/accounts/${encodeURIComponent(emailAccount)}`,
+      {
+        headers: { Authorization: `Bearer ${instantlyApiKey}` },
+        timeout: 10000,
+      }
+    );
+    const { first_name = '', last_name = '' } = res.data || {};
+    const name = [first_name, last_name].filter(Boolean).join(' ').trim();
+    console.log(chalk.gray(`   [Sending Account] ${emailAccount} → "${name || '(no name in response)'}"`));
+    sendingAccountNameCache.set(cacheKey, name);
+    return name;
+  } catch (err) {
+    console.warn(chalk.yellow(`⚠️ Could not fetch sending account for ${emailAccount}: ${err.message}`));
+    if (err.response?.data) console.warn(chalk.yellow(`   Response: ${JSON.stringify(err.response.data)}`));
+    // Fallback: derive from email local part
+    const derived = emailAccount.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    console.log(chalk.gray(`   [Sending Account] Derived fallback: "${derived}"`));
+    sendingAccountNameCache.set(cacheKey, derived);
+    return derived;
+  }
+}
+
+async function personalizeAutoReply(template, replyData, instantlyData, sendingAccountName, openaiClient) {
+  const leadContext = {
+    company_name:        replyData.company_name  || instantlyData?.payload?.company || '',
+    sendingAccountName:  sendingAccountName       || '',
+  };
+
+  console.log(chalk.gray(` [Auto-reply] leadContext → company_name: "${leadContext.company_name}", sendingAccountName: "${leadContext.sendingAccountName}"`));
+
+  const prompt = `You are an email personalization assistant. Replace every placeholder in the plain text template below using the rules and data provided. Do not change any other wording.
+
+PLACEHOLDER RULES:
+1. {{Company Name}}
+   - Use company_name directly.
+   - If empty, leave blank (do not invent a name).
+
+2. {{sendingAccountName}}
+   - Use sendingAccountName directly — it has already been resolved.
+
+LEAD DATA:
+${JSON.stringify(leadContext, null, 2)}
+
+TEMPLATE (plain text):
+${template.text}
+
+Return ONLY valid JSON:
+{
+  "text": "personalized plain text here",
+  "resolved": {
+    "Company Name": "value used",
+    "sendingAccountName": "value used"
+  }
+}`;
+
+  return withRetry(async () => {
+    const response = await openaiClient.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: 'You are an email personalization assistant. Return only valid JSON.' },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+    });
+    const result = JSON.parse(response.choices[0].message.content);
+    if (result.resolved) {
+      console.log(chalk.gray(`   [Auto-reply] Resolved → Company Name: "${result.resolved['Company Name']}" | Sender: "${result.resolved['sendingAccountName']}"`));
+    }
+    const html = plainTextToHtml(result.text);
+    console.log(chalk.gray(`   [Auto-reply] Generated HTML from plain text (${html.length} chars)`));
+    return { text: result.text, html };
+  }, 'OpenAI auto-reply personalization');
+}
+
+// =======================
+// Auto-Reply — Send via Instantly
+// =======================
+async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantlyApiKey, openaiClient) {
+  if (!reply.email_id) {
+    console.log(chalk.yellow('⚠️ Auto-reply skipped — no email_id (reply_to_uuid) on reply document'));
+    return false;
+  }
+  if (!reply.email_account) {
+    console.log(chalk.yellow('⚠️ Auto-reply skipped — no email_account on reply document'));
+    return false;
+  }
+
+  try {
+    console.log(chalk.cyan(`✉️  Fetching sending account name for: ${reply.email_account}`));
+    const sendingAccountName = await fetchSendingAccountName(reply.email_account, instantlyApiKey);
+
+    console.log(chalk.cyan('✉️  Personalizing auto-reply template via OpenAI...'));
+    const personalized = await personalizeAutoReply(
+      { text: autoReply.bodyText },
+      reply,
+      instantlyData,
+      sendingAccountName,
+      openaiClient
+    );
+
+    const autoReplyPayload = {
+      eaccount:      reply.email_account,
+      reply_to_uuid: reply.email_id,
+      subject:       reply.reply_subject,
+      body:          { html: personalized.html, text: personalized.text },
+    };
+    console.log(chalk.cyan(`✉️  Sending auto-reply to ${reply.lead_email} via Instantly...`));
+    console.log(chalk.gray(`   eaccount: ${autoReplyPayload.eaccount}`));
+    console.log(chalk.gray(`   reply_to_uuid: ${autoReplyPayload.reply_to_uuid}`));
+    console.log(chalk.gray(`   subject: ${autoReplyPayload.subject}`));
+    console.log(chalk.gray(`   body.html length: ${personalized.html?.length ?? 0} chars`));
+    console.log(chalk.gray(`   body.text length: ${personalized.text?.length ?? 0} chars`));
+
+    await awaitRateLimit();
+    const res = await axios.post(
+      'https://api.instantly.ai/api/v2/emails/reply',
+      autoReplyPayload,
+      {
+        headers: {
+          Authorization:  `Bearer ${instantlyApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    console.log(chalk.green(`✅ Auto-reply sent to ${reply.lead_email} (status: ${res.status})`));
+    return true;
+  } catch (err) {
+    console.error(chalk.red(`❌ Auto-reply failed for ${reply.lead_email}:`), err.response?.data || err.message);
+    if (err.response?.data) {
+      console.error(chalk.red(`   Status: ${err.response.status}`));
+      console.error(chalk.red(`   Full error: ${JSON.stringify(err.response.data, null, 2)}`));
+    }
+    return false;
+  }
+}
+
+// =======================
 // Instantly — Update Lead Interest Status
 // =======================
-async function updateInstantlyInterest(leadEmail, instantlyApiKey, interestValue = 56) {
+async function updateInstantlyInterest(leadEmail, instantlyApiKey, interestValue = 60) {
   if (!leadEmail) return false;
   try {
     await axios.post(
@@ -689,6 +912,7 @@ async function processReply(reply) {
     sheetHeaders,
     manualColCount,
     addressMapping,
+    autoReply,
     googleSheetId,
     tenantCredentials,
     tenantSettings,
@@ -760,6 +984,12 @@ async function processReply(reply) {
 
     if (appended) {
       addEmailToCache(sheetKey, leadEmail);
+
+      // Auto-reply step — only runs when enabled on the campaign type.
+      if (autoReply?.enabled) {
+        await sendInstantlyAutoReply(reply, autoReply, instantlyData, instantlyApiKey, openaiClient);
+      }
+
       await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
       await updateInstantlyInterest(leadEmail, instantlyApiKey, 56);
       console.log(chalk.green(`✅ Reply fully processed: ${leadEmail} → "${sheetName}"`));

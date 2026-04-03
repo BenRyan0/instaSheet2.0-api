@@ -34,10 +34,10 @@ router.get('/:id', async (req, res) => {
 });
 
 // POST /api/campaign-types
-// Body: { tenant, name, sheetName, emailTemplate, manualColCount?, addressMapping?, sheetHeaders? }
+// Body: { tenant, name, sheetName, emailTemplate, manualColCount?, addressMapping?, sheetHeaders?, autoReply? }
 router.post('/', async (req, res) => {
   try {
-    const { tenant, name, sheetName, emailTemplate, manualColCount, addressMapping, sheetHeaders } = req.body;
+    const { tenant, name, sheetName, emailTemplate, manualColCount, addressMapping, sheetHeaders, autoReply } = req.body;
 
     const missing = ['tenant', 'name', 'sheetName', 'emailTemplate'].filter(k => !req.body[k]);
     if (missing.length) {
@@ -49,6 +49,7 @@ router.post('/', async (req, res) => {
       ...(manualColCount !== undefined && { manualColCount }),
       ...(addressMapping && { addressMapping }),
       ...(sheetHeaders?.length && { sheetHeaders }),
+      ...(autoReply !== undefined && { autoReply }),
     });
 
     await hydrateRouteCache();
@@ -64,7 +65,7 @@ router.post('/', async (req, res) => {
 // PUT /api/campaign-types/:id
 router.put('/:id', async (req, res) => {
   try {
-    const allowed = ['name', 'sheetName', 'emailTemplate', 'sheetHeaders', 'manualColCount', 'addressMapping', 'isActive'];
+    const allowed = ['name', 'sheetName', 'emailTemplate', 'sheetHeaders', 'manualColCount', 'addressMapping', 'isActive', 'autoReply'];
     const update = Object.fromEntries(
       Object.entries(req.body).filter(([k]) => allowed.includes(k))
     );

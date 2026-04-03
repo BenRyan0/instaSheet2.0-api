@@ -38,6 +38,7 @@ export async function hydrateRouteCache() {
       sheetHeaders:       ct.sheetHeaders,
       manualColCount:     ct.manualColCount,
       addressMapping:     ct.addressMapping,
+      autoReply:          ct.autoReply,
       googleSheetId:      tenant.googleSheetId,
       tenantCredentials:  tenant.credentials,
       tenantSettings:     tenant.settings,

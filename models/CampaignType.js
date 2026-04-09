@@ -95,6 +95,30 @@ const CampaignTypeSchema = new mongoose.Schema({
     },
   },
 
+  // When enabled, the system checks if any of requiredFields are blank after
+  // encoding a lead. If so, it sends a follow-up via Instantly asking for
+  // the missing data. When the lead replies, the existing sheet row is updated
+  // in place instead of creating a new row.
+  dataRequestFollowUp: {
+    enabled: {
+      type: Boolean,
+      default: false,
+    },
+    // Sheet column names that must be non-empty; any blank ones trigger a follow-up.
+    requiredFields: {
+      type: [String],
+      default: [],
+    },
+    subject: {
+      type: String,
+      default: '',
+    },
+    bodyText: {
+      type: String,
+      default: '',
+    },
+  },
+
   isActive: {
     type: Boolean,
     default: true,

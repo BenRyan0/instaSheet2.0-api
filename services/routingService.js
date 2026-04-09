@@ -31,17 +31,18 @@ export async function hydrateRouteCache() {
     if (!ct || !tenant || !tenant.isActive || !ct.isActive) continue;
 
     routeCache.set(campaign.campaignId, {
-      tenantName:         tenant.name,
-      sheetName:          ct.sheetName,
-      campaignType:       ct.name,
-      emailTemplate:      ct.emailTemplate,
-      sheetHeaders:       ct.sheetHeaders,
-      manualColCount:     ct.manualColCount,
-      addressMapping:     ct.addressMapping,
-      autoReply:          ct.autoReply,
-      googleSheetId:      tenant.googleSheetId,
-      tenantCredentials:  tenant.credentials,
-      tenantSettings:     tenant.settings,
+      tenantName:             tenant.name,
+      sheetName:              ct.sheetName,
+      campaignType:           ct.name,
+      emailTemplate:          ct.emailTemplate,
+      sheetHeaders:           ct.sheetHeaders,
+      manualColCount:         ct.manualColCount,
+      addressMapping:         ct.addressMapping,
+      autoReply:              ct.autoReply,
+      dataRequestFollowUp:    ct.dataRequestFollowUp,
+      googleSheetId:          tenant.googleSheetId,
+      tenantCredentials:      tenant.credentials,
+      tenantSettings:         tenant.settings,
     });
   }
 

@@ -13,6 +13,7 @@ import {
   getAllRoutes,
 } from './services/routingService.js';
 import Reply from './models/Reply.js';
+import DataRequest from './models/DataRequest.js';
 import tenantRoutes from './routes/tenants.js';
 import campaignTypeRoutes from './routes/campaignTypes.js';
 import campaignRoutes from './routes/campaigns.js';
@@ -686,7 +687,7 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
       requestBody: { values: [rowArray] },
     });
     console.log(chalk.green(`✅ Row ${nextRow} written to "${sheetName}" (${startCol}–${lastCol})\n`));
-    return true;
+    return nextRow;
   }, `Sheet append (${sheetName})`);
 }
 
@@ -857,6 +858,197 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
 }
 
 // =======================
+// Data-Request Follow-Up — Extract missing fields from a follow-up reply
+// =======================
+async function extractMissingFieldsFromReply(replyText, requestedFields, openaiClient) {
+  const fieldRules = {
+    'Phone From Reply':       'Phone number — format as (XXX) XXX-XXXX. Return null if not found.',
+    'Insurance Provider':     'Insurance provider name (e.g. "UnitedHealth", "Blue Cross", "Humana"). Return null if not mentioned.',
+    'Medicare Advantage':     '"Yes" if lead has Medicare Advantage, "No" if they do not, null if unclear.',
+    'Medicare Advantage Type': 'Plan type — "HMO", "PPO", or another plan type if stated. Return null if not mentioned.',
+    'Medicaid':               '"Yes" if lead has Medicaid, "No" if they do not, null if unclear.',
+  };
+
+  const instructions = requestedFields
+    .map(f => `  "${f}": ${fieldRules[f] || 'Extract from reply text. Return null if not found.'}`)
+    .join('\n');
+
+  const jsonShape = JSON.stringify(
+    Object.fromEntries(requestedFields.map(f => [f, '...'])),
+    null, 2
+  );
+
+  const prompt = `You are extracting specific data fields from a lead's follow-up email reply.
+
+REPLY TEXT:
+${replyText}
+
+FIELDS TO EXTRACT:
+${instructions}
+
+Return ONLY valid JSON matching this exact shape (null for any field not found):
+${jsonShape}`;
+
+  return withRetry(async () => {
+    const response = await openaiClient.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: 'You are a precise data extraction assistant. Return only valid JSON.' },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+    });
+    return JSON.parse(response.choices[0].message.content);
+  }, 'OpenAI missing fields extraction');
+}
+
+// =======================
+// Data-Request Follow-Up — Update specific cells in an existing sheet row
+// =======================
+async function updateSheetCells(sheetName, rowNumber, fieldUpdates, manualColCount, sheetHeaders, sheetsClient, googleSheetId) {
+  const updates = Object.entries(fieldUpdates).filter(([, v]) => v !== null && v !== undefined && v !== '');
+
+  if (updates.length === 0) {
+    console.log(chalk.yellow('   [DataFill] No non-empty values to write'));
+    return;
+  }
+
+  for (const [field, value] of updates) {
+    const colIndex = sheetHeaders.indexOf(field);
+    if (colIndex === -1) {
+      console.log(chalk.yellow(`   [DataFill] Field "${field}" not in sheetHeaders — skipping`));
+      continue;
+    }
+    const col = columnLetter(manualColCount + 1 + colIndex);
+    const range = `${sheetName}!${col}${rowNumber}`;
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: googleSheetId,
+      range,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[String(value)]] },
+    });
+    console.log(chalk.green(`   [DataFill] ${col}${rowNumber} "${field}" ← "${value}"`));
+  }
+}
+
+// =======================
+// Data-Request Follow-Up — Send follow-up email asking for missing fields
+// =======================
+async function sendDataRequestFollowUp(reply, route, missingFields, rowNumber, instantlyApiKey, openaiClient) {
+  const { dataRequestFollowUp, googleSheetId, sheetName, tenantCredentials } = route;
+
+  if (!reply.email_id) {
+    console.log(chalk.yellow('⚠️ Data-request follow-up skipped — no email_id on reply'));
+    return;
+  }
+  if (!reply.email_account) {
+    console.log(chalk.yellow('⚠️ Data-request follow-up skipped — no email_account on reply'));
+    return;
+  }
+
+  // Guard: only ever send one data-request follow-up per lead per campaign,
+  // regardless of resolved status — prevents re-sending if data was already collected.
+  const alreadySent = await DataRequest.findOne({
+    lead_email:  reply.lead_email,
+    campaign_id: reply.campaign_id,
+  });
+  if (alreadySent) {
+    console.log(chalk.gray(`   [DataRequest] Follow-up already sent for ${reply.lead_email} — skipping`));
+    return;
+  }
+
+  console.log(chalk.cyan(`📋 Sending data-request follow-up for ${reply.lead_email} — missing: ${missingFields.join(', ')}`));
+
+  try {
+    const sendingAccountName = await fetchSendingAccountName(reply.email_account, instantlyApiKey);
+
+    const personalized = await personalizeAutoReply(
+      { text: dataRequestFollowUp.bodyText },
+      reply,
+      null,
+      sendingAccountName,
+      openaiClient
+    );
+
+    const payload = {
+      eaccount:      reply.email_account,
+      reply_to_uuid: reply.email_id,
+      subject:       reply.reply_subject,
+      body:          { html: personalized.html, text: personalized.text },
+    };
+
+    await awaitRateLimit();
+    const res = await axios.post(
+      'https://api.instantly.ai/api/v2/emails/reply',
+      payload,
+      {
+        headers: {
+          Authorization:  `Bearer ${instantlyApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    console.log(chalk.green(`✅ Data-request follow-up sent to ${reply.lead_email} (status: ${res.status})`));
+
+    await DataRequest.create({
+      lead_email:      reply.lead_email,
+      campaign_id:     reply.campaign_id,
+      googleSheetId,
+      sheetName,
+      sheetRowNumber:  rowNumber,
+      requestedFields: missingFields,
+      emailAccount:    reply.email_account,
+      replyEmailId:    reply.email_id,
+    });
+
+    console.log(chalk.green(`✅ DataRequest saved — row ${rowNumber}, fields: ${missingFields.join(', ')}`));
+  } catch (err) {
+    console.error(chalk.red(`❌ Data-request follow-up failed for ${reply.lead_email}:`), err.response?.data || err.message);
+  }
+}
+
+// =======================
+// Data-Request Follow-Up — Handle a lead's reply to our data-request email
+// =======================
+async function handleDataFillReply(reply, pendingRequest, route, openaiClient, sheetsClient) {
+  const { sheetName, sheetHeaders, manualColCount, googleSheetId } = route;
+  const leadEmail = reply.lead_email;
+
+  console.log(chalk.cyan(`\n📋 [DataFill] Handling data-fill reply from ${leadEmail}`));
+  console.log(chalk.gray(`   Updating row ${pendingRequest.sheetRowNumber} in "${sheetName}"`));
+  console.log(chalk.gray(`   Fields requested: ${pendingRequest.requestedFields.join(', ')}`));
+
+  try {
+    const replyText = reply.reply_text_snippet || reply.reply_text || '';
+
+    const extracted = await extractMissingFieldsFromReply(replyText, pendingRequest.requestedFields, openaiClient);
+    console.log(chalk.gray(`   Extracted: ${JSON.stringify(extracted)}`));
+
+    await updateSheetCells(
+      sheetName,
+      pendingRequest.sheetRowNumber,
+      extracted,
+      manualColCount,
+      sheetHeaders,
+      sheetsClient,
+      googleSheetId
+    );
+
+    await DataRequest.updateOne({ _id: pendingRequest._id }, { $set: { isResolved: true } });
+    await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
+
+    console.log(chalk.green(`✅ [DataFill] Row ${pendingRequest.sheetRowNumber} updated — ${leadEmail}`));
+    return true;
+  } catch (err) {
+    console.error(chalk.red(`❌ [DataFill] Failed for ${leadEmail}:`), err.message);
+    return false;
+  }
+}
+
+// =======================
 // Instantly — Update Lead Interest Status
 // =======================
 async function updateInstantlyInterest(leadEmail, instantlyApiKey, interestValue = 60) {
@@ -927,7 +1119,20 @@ async function processReply(reply) {
   console.log('='.repeat(60));
 
   try {
-    // Step 0: Pre-flight duplicate check (fast in-memory cache)
+    // Step 0a: Data-fill intercept — check for a pending DataRequest before the
+    // dedup cache, because the lead's follow-up reply has the same email+campaign
+    // as the original and would otherwise be silently skipped.
+    const pendingRequest = await DataRequest.findOne({
+      lead_email:  leadEmail,
+      campaign_id: reply.campaign_id,
+      isResolved:  false,
+    });
+    if (pendingRequest) {
+      console.log(chalk.cyan(`📋 [DataFill] Pending DataRequest found for ${leadEmail} — routing to data-fill handler`));
+      return handleDataFillReply(reply, pendingRequest, route, openaiClient, sheets);
+    }
+
+    // Step 0b: Pre-flight duplicate check (fast in-memory cache)
     if (isEmailInCache(sheetKey, leadEmail)) {
       console.log(chalk.yellow(`⏭️ Skipping — already in sheet "${sheetName}": ${leadEmail}`));
       await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
@@ -980,10 +1185,21 @@ async function processReply(reply) {
     }
 
     // Step 6: Write to Google Sheet
-    const appended = await appendToSheet(sheetName, enrichedData, manualColCount, sheetHeaders, sheets, googleSheetId);
+    const rowNumber = await appendToSheet(sheetName, enrichedData, manualColCount, sheetHeaders, sheets, googleSheetId);
 
-    if (appended) {
+    if (rowNumber) {
       addEmailToCache(sheetKey, leadEmail);
+
+      // Data-request follow-up — send if configured and required fields are blank.
+      const drConfig = route.dataRequestFollowUp;
+      if (drConfig?.enabled && drConfig.requiredFields?.length) {
+        const missingFields = drConfig.requiredFields.filter(f => !enrichedData[f]);
+        if (missingFields.length > 0) {
+          await sendDataRequestFollowUp(reply, route, missingFields, rowNumber, instantlyApiKey, openaiClient);
+        } else {
+          console.log(chalk.gray('   [DataRequest] All required fields present — no follow-up needed'));
+        }
+      }
 
       // Auto-reply step — only runs when enabled on the campaign type.
       if (autoReply?.enabled) {

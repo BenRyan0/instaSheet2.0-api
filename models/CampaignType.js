@@ -117,6 +117,15 @@ const CampaignTypeSchema = new mongoose.Schema({
       type: String,
       default: '',
     },
+    // Column name that is the "make-or-break" field for resolving the DataRequest.
+    // If set and the lead provides this field in their reply, the DataRequest resolves
+    // immediately even if other requiredFields are still missing, and a CRM payload
+    // is queued for dispatch once credentials are configured.
+    // Leave blank to use the original behaviour (always resolve after any reply).
+    priorityField: {
+      type: String,
+      default: '',
+    },
   },
 
   isActive: {

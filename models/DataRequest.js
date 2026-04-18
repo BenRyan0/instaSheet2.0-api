@@ -59,4 +59,9 @@ const DataRequestSchema = new mongoose.Schema({
 // Compound index for the pre-dedup lookup in processReply.
 DataRequestSchema.index({ lead_email: 1, campaign_id: 1, isResolved: 1 });
 
+// Unique index: prevents duplicate DataRequest documents for the exact same
+// reply email (replyEmailId), campaign, and lead — hard DB-level guard against
+// race conditions that bypass the application-level check.
+DataRequestSchema.index({ replyEmailId: 1, campaign_id: 1, lead_email: 1 }, { unique: true, sparse: true });
+
 export default mongoose.model('DataRequest', DataRequestSchema);

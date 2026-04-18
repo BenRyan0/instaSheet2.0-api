@@ -698,9 +698,15 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
 // =======================
 function plainTextToHtml(text) {
   if (!text) return '';
+  const urlRegex = /(https?:\/\/[^\s<>"]+)/g;
   return text
     .split(/\n\n+/)
-    .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
+    .map(para =>
+      `<p>${para
+        .replace(/\n/g, '<br>')
+        .replace(urlRegex, '<a href="$1">$1</a>')
+      }</p>`
+    )
     .join('\n');
 }
 
@@ -740,13 +746,15 @@ async function fetchSendingAccountName(emailAccount, instantlyApiKey) {
   }
 }
 
-async function personalizeAutoReply(template, replyData, instantlyData, sendingAccountName, openaiClient) {
+async function personalizeAutoReply(template, replyData, instantlyData, sendingAccountName, openaiClient, templateVars = {}) {
   const leadContext = {
     company_name:        replyData.company_name  || instantlyData?.payload?.company || '',
     sendingAccountName:  sendingAccountName       || '',
+    firstName:           instantlyData?.first_name || replyData.display_name?.split(' ')[0] || '',
+    link:                templateVars.link         || '',
   };
 
-  console.log(chalk.gray(` [Auto-reply] leadContext → company_name: "${leadContext.company_name}", sendingAccountName: "${leadContext.sendingAccountName}"`));
+  console.log(chalk.gray(` [Auto-reply] leadContext → company_name: "${leadContext.company_name}", sendingAccountName: "${leadContext.sendingAccountName}", firstName: "${leadContext.firstName}", link: "${leadContext.link}"`));
 
   const prompt = `You are an email personalization assistant. Replace every placeholder in the plain text template below using the rules and data provided. Do not change any other wording.
 
@@ -757,6 +765,14 @@ PLACEHOLDER RULES:
 
 2. {{sendingAccountName}}
    - Use sendingAccountName directly — it has already been resolved.
+
+3. {{firstName}}
+   - Use firstName directly.
+   - If empty, leave blank (do not invent a name).
+
+4. {{link}}
+   - Use link directly (it is a URL).
+   - If empty, leave blank (do not invent a URL).
 
 LEAD DATA:
 ${JSON.stringify(leadContext, null, 2)}
@@ -769,7 +785,9 @@ Return ONLY valid JSON:
   "text": "personalized plain text here",
   "resolved": {
     "Company Name": "value used",
-    "sendingAccountName": "value used"
+    "sendingAccountName": "value used",
+    "firstName": "value used",
+    "link": "value used"
   }
 }`;
 
@@ -785,7 +803,7 @@ Return ONLY valid JSON:
     });
     const result = JSON.parse(response.choices[0].message.content);
     if (result.resolved) {
-      console.log(chalk.gray(`   [Auto-reply] Resolved → Company Name: "${result.resolved['Company Name']}" | Sender: "${result.resolved['sendingAccountName']}"`));
+      console.log(chalk.gray(`   [Auto-reply] Resolved → Company Name: "${result.resolved['Company Name']}" | Sender: "${result.resolved['sendingAccountName']}" | First Name: "${result.resolved['firstName']}" | Link: "${result.resolved['link']}"`));
     }
     const html = plainTextToHtml(result.text);
     console.log(chalk.gray(`   [Auto-reply] Generated HTML from plain text (${html.length} chars)`));
@@ -816,7 +834,8 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
       reply,
       instantlyData,
       sendingAccountName,
-      openaiClient
+      openaiClient,
+      { link: autoReply.link || '' }
     );
 
     const autoReplyPayload = {
@@ -860,17 +879,23 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
 // =======================
 // Data-Request Follow-Up — Extract missing fields from a follow-up reply
 // =======================
-async function extractMissingFieldsFromReply(replyText, requestedFields, openaiClient) {
+async function extractMissingFieldsFromReply(replyText, requestedFields, openaiClient, context = {}) {
+  const { dataRequestBodyText = '', companyName = '', displayName = '' } = context;
+
   const fieldRules = {
-    'Phone From Reply':       'Phone number — format as (XXX) XXX-XXXX. Return null if not found.',
-    'Insurance Provider':     'Insurance provider name (e.g. "UnitedHealth", "Blue Cross", "Humana"). Return null if not mentioned.',
-    'Medicare Advantage':     '"Yes" if lead has Medicare Advantage, "No" if they do not, null if unclear.',
+    'Phone From Reply':        'Phone number — format as (XXX) XXX-XXXX. Return null if not found.',
+    'Insurance Provider':      'Insurance provider name (e.g. "UnitedHealth", "Blue Cross", "Humana"). Return null if not mentioned.',
+    'Medicare Advantage':      '"Yes" if lead has Medicare Advantage, "No" if they do not, null if unclear.',
     'Medicare Advantage Type': 'Plan type — "HMO", "PPO", or another plan type if stated. Return null if not mentioned.',
-    'Medicaid':               '"Yes" if lead has Medicaid, "No" if they do not, null if unclear.',
+    'Medicaid':                '"Yes" if lead has Medicaid, "No" if they do not, null if unclear.',
   };
 
+  const unknownFallback = dataRequestBodyText
+    ? 'Based on the data-request email above, find this field\'s value in the reply. Return null if not clearly stated.'
+    : 'Extract from reply text. Return null if not found.';
+
   const instructions = requestedFields
-    .map(f => `  "${f}": ${fieldRules[f] || 'Extract from reply text. Return null if not found.'}`)
+    .map(f => `  "${f}": ${fieldRules[f] || unknownFallback}`)
     .join('\n');
 
   const jsonShape = JSON.stringify(
@@ -878,9 +903,20 @@ async function extractMissingFieldsFromReply(replyText, requestedFields, openaiC
     null, 2
   );
 
-  const prompt = `You are extracting specific data fields from a lead's follow-up email reply.
+  const contextSection = dataRequestBodyText
+    ? `CONTEXT — WHAT WE ASKED THE LEAD:
+${dataRequestBodyText}
 
-REPLY TEXT:
+LEAD CONTEXT:
+- Name: ${displayName || 'Unknown'}
+- Company: ${companyName || 'Unknown'}
+
+`
+    : '';
+
+  const prompt = `You are extracting specific data fields from a lead's reply to a follow-up email.
+
+${contextSection}LEAD'S REPLY:
 ${replyText}
 
 FIELDS TO EXTRACT:
@@ -893,7 +929,7 @@ ${jsonShape}`;
     const response = await openaiClient.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: 'You are a precise data extraction assistant. Return only valid JSON.' },
+        { role: 'system', content: 'You are a precise data extraction assistant. You have full context of what was asked and what the lead replied. Return only valid JSON.' },
         { role: 'user', content: prompt },
       ],
       temperature: 0.1,
@@ -947,14 +983,17 @@ async function sendDataRequestFollowUp(reply, route, missingFields, rowNumber, i
     return;
   }
 
-  // Guard: only ever send one data-request follow-up per lead per campaign,
-  // regardless of resolved status — prevents re-sending if data was already collected.
+  // Guard: prevent sending a duplicate data-request follow-up.
+  // Check 1 — same lead + campaign (any email): broad guard regardless of resolved status.
+  // Check 2 — same email_id + campaign + lead: exact dedup for the specific reply that triggered this.
   const alreadySent = await DataRequest.findOne({
-    lead_email:  reply.lead_email,
-    campaign_id: reply.campaign_id,
+    $or: [
+      { lead_email: reply.lead_email, campaign_id: reply.campaign_id },
+      { replyEmailId: reply.email_id, campaign_id: reply.campaign_id, lead_email: reply.lead_email },
+    ],
   });
   if (alreadySent) {
-    console.log(chalk.gray(`   [DataRequest] Follow-up already sent for ${reply.lead_email} — skipping`));
+    console.log(chalk.gray(`   [DataRequest] Follow-up already sent for ${reply.lead_email} (email_id: ${reply.email_id}) — skipping`));
     return;
   }
 
@@ -968,7 +1007,8 @@ async function sendDataRequestFollowUp(reply, route, missingFields, rowNumber, i
       reply,
       null,
       sendingAccountName,
-      openaiClient
+      openaiClient,
+      { link: dataRequestFollowUp.link || '' }
     );
 
     const payload = {
@@ -1024,7 +1064,11 @@ async function handleDataFillReply(reply, pendingRequest, route, openaiClient, s
   try {
     const replyText = reply.reply_text_snippet || reply.reply_text || '';
 
-    const extracted = await extractMissingFieldsFromReply(replyText, pendingRequest.requestedFields, openaiClient);
+    const extracted = await extractMissingFieldsFromReply(replyText, pendingRequest.requestedFields, openaiClient, {
+      dataRequestBodyText: route.dataRequestFollowUp?.bodyText || '',
+      companyName:         reply.company_name || '',
+      displayName:         reply.display_name || '',
+    });
     console.log(chalk.gray(`   Extracted: ${JSON.stringify(extracted)}`));
 
     await updateSheetCells(
@@ -1037,10 +1081,25 @@ async function handleDataFillReply(reply, pendingRequest, route, openaiClient, s
       googleSheetId
     );
 
-    await DataRequest.updateOne({ _id: pendingRequest._id }, { $set: { isResolved: true } });
+    const priorityField = route.dataRequestFollowUp?.priorityField || '';
+    const priorityMet   = priorityField && extracted[priorityField];
+
+    // Always mark the reply as processed — we've handled it regardless of outcome.
     await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
 
-    console.log(chalk.green(`✅ [DataFill] Row ${pendingRequest.sheetRowNumber} updated — ${leadEmail}`));
+    if (!priorityField || priorityMet) {
+      // Resolve when: no priority field is configured (original behaviour),
+      // OR the priority field was provided by the lead.
+      await DataRequest.updateOne({ _id: pendingRequest._id }, { $set: { isResolved: true } });
+      console.log(chalk.green(`✅ [DataFill] Row ${pendingRequest.sheetRowNumber} resolved — ${leadEmail}`));
+
+
+    } else {
+      // Priority field was not provided — leave DataRequest open so the lead
+      // can reply again and another attempt will be made.
+      console.log(chalk.yellow(`⏳ [DataFill] Priority field "${priorityField}" not found — DataRequest stays open for ${leadEmail}`));
+    }
+
     return true;
   } catch (err) {
     console.error(chalk.red(`❌ [DataFill] Failed for ${leadEmail}:`), err.message);
@@ -1193,11 +1252,15 @@ async function processReply(reply) {
       // Data-request follow-up — send if configured and required fields are blank.
       const drConfig = route.dataRequestFollowUp;
       if (drConfig?.enabled && drConfig.requiredFields?.length) {
-        const missingFields = drConfig.requiredFields.filter(f => !enrichedData[f]);
-        if (missingFields.length > 0) {
-          await sendDataRequestFollowUp(reply, route, missingFields, rowNumber, instantlyApiKey, openaiClient);
+        if (enrichedData['Phone From Reply']) {
+          console.log(chalk.gray('   [DataRequest] Phone From Reply already filled — skipping follow-up'));
         } else {
-          console.log(chalk.gray('   [DataRequest] All required fields present — no follow-up needed'));
+          const missingFields = drConfig.requiredFields.filter(f => !enrichedData[f]);
+          if (missingFields.length > 0) {
+            await sendDataRequestFollowUp(reply, route, missingFields, rowNumber, instantlyApiKey, openaiClient);
+          } else {
+            console.log(chalk.gray('   [DataRequest] All required fields present — no follow-up needed'));
+          }
         }
       }
 
@@ -1445,6 +1508,7 @@ app.post('/refresh-routes', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 app.get('/check-sheet-headers', async (req, res) => {
   const { sheetName } = req.query;

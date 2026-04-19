@@ -14,6 +14,7 @@ import {
 } from './services/routingService.js';
 import Reply from './models/Reply.js';
 import DataRequest from './models/DataRequest.js';
+import AutoReplyRecord from './models/AutoReplyRecord.js';
 import tenantRoutes from './routes/tenants.js';
 import campaignTypeRoutes from './routes/campaignTypes.js';
 import campaignRoutes from './routes/campaigns.js';
@@ -64,7 +65,7 @@ function clearSheetEmailCache() {
 
 async function hydrateEmailCache(sheetKey, sheetName, googleSheetId, sheetsClient, manualColCount, headers) {
   if (sheetEmailCache[sheetKey]) return;
-  sheetEmailCache[sheetKey] = new Set();
+  sheetEmailCache[sheetKey] = new Map();
 
   try {
     const lastCol = columnLetter(manualColCount + headers.length);
@@ -82,7 +83,7 @@ async function hydrateEmailCache(sheetKey, sheetName, googleSheetId, sheetsClien
 
     for (let i = 1; i < rows.length; i++) {
       const email = rows[i][emailColIndex];
-      if (email) sheetEmailCache[sheetKey].add(email.toLowerCase().trim());
+      if (email) sheetEmailCache[sheetKey].set(email.toLowerCase().trim(), i + 1); // i+1 = 1-based sheet row
     }
 
     console.log(chalk.gray(`   [Cache] "${sheetName}" — loaded ${sheetEmailCache[sheetKey].size} known emails`));
@@ -97,10 +98,15 @@ function isEmailInCache(sheetKey, email) {
   return cache ? cache.has(email.toLowerCase().trim()) : false;
 }
 
-function addEmailToCache(sheetKey, email) {
+function getRowFromCache(sheetKey, email) {
+  if (!email) return null;
+  return sheetEmailCache[sheetKey]?.get(email.toLowerCase().trim()) ?? null;
+}
+
+function addEmailToCache(sheetKey, email, rowNumber) {
   if (!email) return;
-  if (!sheetEmailCache[sheetKey]) sheetEmailCache[sheetKey] = new Set();
-  sheetEmailCache[sheetKey].add(email.toLowerCase().trim());
+  if (!sheetEmailCache[sheetKey]) sheetEmailCache[sheetKey] = new Map();
+  sheetEmailCache[sheetKey].set(email.toLowerCase().trim(), rowNumber ?? null);
 }
 
 // =======================
@@ -1108,6 +1114,85 @@ async function handleDataFillReply(reply, pendingRequest, route, openaiClient, s
 }
 
 // =======================
+// Auto-Reply Follow-Up — Handle a lead's reply to our auto-reply email
+// Runs eligibility analysis on the new reply and updates key cells in the
+// existing sheet row. Does not create a duplicate row.
+// =======================
+async function handleAutoReplyResponse(reply, rowNumber, route, openaiClient, sheetsClient, autoReplyRecord = null) {
+  const { sheetName, sheetHeaders, manualColCount, googleSheetId, campaignType, emailTemplate } = route;
+  const leadEmail = reply.lead_email;
+
+  console.log(chalk.cyan(`\n📨 [AutoReplyResponse] Handling follow-up reply from ${leadEmail}`));
+  console.log(chalk.gray(`   Updating row ${rowNumber} in "${sheetName}"`));
+
+  try {
+    const replyText = reply.reply_text_snippet || reply.reply_text || '';
+
+    const analysis = await analyzeReplyEligibility(
+      replyText,
+      reply.reply_subject || '',
+      { campaignType, emailTemplate },
+      openaiClient
+    );
+
+    // Read the current Details cell so we can append rather than overwrite.
+    let currentDetails = '';
+    if (sheetHeaders.includes('Details')) {
+      const detailsColIndex = sheetHeaders.indexOf('Details');
+      const detailsCol = columnLetter(manualColCount + 1 + detailsColIndex);
+      const detailsRange = `${sheetName}!${detailsCol}${rowNumber}`;
+      try {
+        const cellRes = await sheetsClient.spreadsheets.values.get({
+          spreadsheetId: googleSheetId,
+          range: detailsRange,
+        });
+        currentDetails = cellRes.data.values?.[0]?.[0] || '';
+      } catch (_) {}
+    }
+
+    const appendedDetails = currentDetails
+      ? `REPLY:${replyText}\n${currentDetails}`
+      : `REPLY:${replyText}`;
+
+    // Fields to update in the existing row based on the follow-up reply.
+    const updates = {
+      'Hot Lead':            analysis.interestLevel     || '',
+      'For Scheduling':      analysis.forScheduling     || '',
+      'Overall Eligibility': analysis.overallEligibility || '',
+      'Details':             appendedDetails,
+      // Only write Phone From Reply if the lead provided one — don't clear an existing number.
+      ...(analysis.phoneFromReply ? { 'Phone From Reply': analysis.phoneFromReply } : {}),
+    };
+
+    // Only write fields that exist in this campaign's sheet headers.
+    const filteredUpdates = Object.fromEntries(
+      Object.entries(updates).filter(([field]) => sheetHeaders.includes(field))
+    );
+
+    await updateSheetCells(
+      sheetName,
+      rowNumber,
+      filteredUpdates,
+      manualColCount,
+      sheetHeaders,
+      sheetsClient,
+      googleSheetId
+    );
+
+    await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
+    if (autoReplyRecord) {
+      await AutoReplyRecord.updateOne({ _id: autoReplyRecord._id }, { $set: { isResolved: true } });
+    }
+
+    console.log(chalk.green(`✅ [AutoReplyResponse] Row ${rowNumber} updated — ${leadEmail}`));
+    return true;
+  } catch (err) {
+    console.error(chalk.red(`❌ [AutoReplyResponse] Failed for ${leadEmail}:`), err.message);
+    return false;
+  }
+}
+
+// =======================
 // Instantly — Update Lead Interest Status
 // =======================
 async function updateInstantlyInterest(leadEmail, instantlyApiKey, interestValue = 60) {
@@ -1191,8 +1276,30 @@ async function processReply(reply) {
       return handleDataFillReply(reply, pendingRequest, route, openaiClient, sheets);
     }
 
-    // Step 0b: Pre-flight duplicate check (fast in-memory cache)
+    // Step 0b: Auto-reply response intercept — check for a pending AutoReplyRecord
+    // before the dedup cache so follow-up replies to our auto-reply are analyzed
+    // and written back to the existing sheet row instead of being dropped.
+    const pendingAutoReply = await AutoReplyRecord.findOne({
+      lead_email:  leadEmail,
+      campaign_id: reply.campaign_id,
+      isResolved:  false,
+    });
+    if (pendingAutoReply) {
+      console.log(chalk.cyan(`📨 [AutoReplyResponse] Pending AutoReplyRecord found for ${leadEmail} — routing to auto-reply response handler`));
+      return handleAutoReplyResponse(reply, pendingAutoReply.sheetRowNumber, route, openaiClient, sheets, pendingAutoReply);
+    }
+
+    // Step 0c: Pre-flight duplicate check (fast in-memory cache).
+    // If autoReply is enabled and we know the row, treat this as a follow-up
+    // reply response instead of dropping it.
     if (isEmailInCache(sheetKey, leadEmail)) {
+      if (autoReply?.enabled) {
+        const cachedRow = getRowFromCache(sheetKey, leadEmail);
+        if (cachedRow) {
+          console.log(chalk.cyan(`📨 [AutoReplyResponse] Follow-up reply detected via cache for ${leadEmail} (row ${cachedRow}) — routing to auto-reply response handler`));
+          return handleAutoReplyResponse(reply, cachedRow, route, openaiClient, sheets);
+        }
+      }
       console.log(chalk.yellow(`⏭️ Skipping — already in sheet "${sheetName}": ${leadEmail}`));
       await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
       return false;
@@ -1247,7 +1354,7 @@ async function processReply(reply) {
     const rowNumber = await appendToSheet(sheetName, enrichedData, manualColCount, sheetHeaders, sheets, googleSheetId);
 
     if (rowNumber) {
-      addEmailToCache(sheetKey, leadEmail);
+      addEmailToCache(sheetKey, leadEmail, rowNumber);
 
       // Data-request follow-up — send if configured and required fields are blank.
       const drConfig = route.dataRequestFollowUp;
@@ -1266,7 +1373,17 @@ async function processReply(reply) {
 
       // Auto-reply step — only runs when enabled on the campaign type.
       if (autoReply?.enabled) {
-        await sendInstantlyAutoReply(reply, autoReply, instantlyData, instantlyApiKey, openaiClient);
+        const autoReplySent = await sendInstantlyAutoReply(reply, autoReply, instantlyData, instantlyApiKey, openaiClient);
+        if (autoReplySent) {
+          await AutoReplyRecord.create({
+            lead_email:     leadEmail,
+            campaign_id:    reply.campaign_id,
+            googleSheetId,
+            sheetName,
+            sheetRowNumber: rowNumber,
+          });
+          console.log(chalk.gray(`   [AutoReplyRecord] Saved — row ${rowNumber}, lead: ${leadEmail}`));
+        }
       }
 
       await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });

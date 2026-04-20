@@ -36,6 +36,36 @@ const AutoReplyRecordSchema = new mongoose.Schema({
     default: false,
     index: true,
   },
+
+  // Sending account used for the auto-reply — needed to thread follow-ups.
+  emailAccount: {
+    type: String,
+    default: '',
+  },
+
+  // email_id of the original lead reply — used as reply_to_uuid for follow-ups.
+  replyEmailId: {
+    type: String,
+    default: '',
+  },
+
+  // Subject line of the original reply thread.
+  replySubject: {
+    type: String,
+    default: '',
+  },
+
+  // How many scheduled follow-ups have been sent so far.
+  followUpCount: {
+    type: Number,
+    default: 0,
+  },
+
+  // When the most recent scheduled follow-up was sent.
+  lastFollowUpAt: {
+    type: Date,
+    default: null,
+  },
 }, {
   timestamps: true,
 });

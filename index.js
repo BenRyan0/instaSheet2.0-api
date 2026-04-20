@@ -684,6 +684,31 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
     const allRows = fullRangeRes.data.values || [];
     const nextRow = allRows.length + 1;
 
+    // Extend the sheet if nextRow would exceed the current grid row limit.
+    const metaRes = await sheetsClient.spreadsheets.get({
+      spreadsheetId: googleSheetId,
+      fields: 'sheets.properties',
+    });
+    const sheetProps = metaRes.data.sheets?.find(s => s.properties.title === sheetName);
+    const currentRowCount = sheetProps?.properties?.gridProperties?.rowCount ?? 1000;
+    if (nextRow > currentRowCount) {
+      const rowsToAdd = Math.max(200, nextRow - currentRowCount + 1);
+      console.log(chalk.yellow(`   [SheetExtend] "${sheetName}" at row limit (${currentRowCount}) — adding ${rowsToAdd} rows`));
+      await sheetsClient.spreadsheets.batchUpdate({
+        spreadsheetId: googleSheetId,
+        requestBody: {
+          requests: [{
+            appendDimension: {
+              sheetId: sheetProps.properties.sheetId,
+              dimension: 'ROWS',
+              length: rowsToAdd,
+            },
+          }],
+        },
+      });
+      console.log(chalk.green(`   [SheetExtend] "${sheetName}" extended to ${currentRowCount + rowsToAdd} rows`));
+    }
+
     const targetRange = `${sheetName}!${startCol}${nextRow}:${lastCol}${nextRow}`;
 
     await sheetsClient.spreadsheets.values.update({
@@ -879,6 +904,126 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
       console.error(chalk.red(`   Full error: ${JSON.stringify(err.response.data, null, 2)}`));
     }
     return false;
+  }
+}
+
+// =======================
+// Sheet Placeholder Resolver
+// Replaces {{Header Name}} tokens in a template string with values from a
+// header→value map built from the lead's sheet row. Tokens that don't match
+// any header are left as-is so personalizeAutoReply can handle them.
+// =======================
+function resolveSheetPlaceholders(template, rowMap) {
+  return template.replace(/\{\{([^}]+)\}\}/g, (match, key) => {
+    const trimmed = key.trim();
+    return trimmed in rowMap ? (rowMap[trimmed] || '') : match;
+  });
+}
+
+// =======================
+// Auto-Reply Follow-Up Scheduler
+// Runs on every scheduler tick. Finds AutoReplyRecords where the lead has not
+// replied and the configured interval has elapsed, then sends a follow-up email
+// using the campaignType's separate autoReplyFollowUp template.
+// =======================
+async function processAutoReplyFollowUps() {
+  const pendingRecords = await AutoReplyRecord.find({ isResolved: false });
+  if (pendingRecords.length === 0) return;
+
+  console.log(chalk.blue(`\n📨 [FollowUp] Checking ${pendingRecords.length} pending auto-reply record(s)...`));
+
+  let sentCount = 0;
+
+  for (const record of pendingRecords) {
+    const route = getRouteForCampaign(record.campaign_id);
+    if (!route?.autoReplyFollowUp?.enabled) continue;
+
+    const { intervalHours = 24, maxFollowUps = 1 } = route.autoReplyFollowUp;
+
+    if (record.followUpCount >= maxFollowUps) continue;
+
+    const lastTime = record.lastFollowUpAt || record.createdAt;
+    const hoursSince = (Date.now() - new Date(lastTime).getTime()) / (1000 * 60 * 60);
+    if (hoursSince < intervalHours) continue;
+
+    if (!record.emailAccount || !record.replyEmailId) {
+      console.log(chalk.yellow(`⚠️ [FollowUp] Skipping ${record.lead_email} — missing emailAccount or replyEmailId`));
+      continue;
+    }
+
+    console.log(chalk.cyan(`✉️  [FollowUp] ${record.lead_email} — ${record.followUpCount + 1}/${maxFollowUps} (${hoursSince.toFixed(1)}h since last contact)`));
+
+    try {
+      const instantlyApiKey = route.tenantCredentials.instantlyApiKey;
+      const openaiClient    = getOpenAIClient(route.tenantCredentials.openAiApiKey);
+      const { sheets }      = await getGoogleClients(route.tenantCredentials.googleServiceAccountJson);
+
+      // Read the full lead row from the sheet and build a header→value map.
+      // This allows any sheet column to be used as a {{Placeholder}} in the template.
+      const rowMap = {};
+      if (record.sheetRowNumber && route.sheetHeaders.length) {
+        const startCol = columnLetter(route.manualColCount + 1);
+        const lastCol  = columnLetter(route.manualColCount + route.sheetHeaders.length);
+        try {
+          const rowRes = await sheets.spreadsheets.values.get({
+            spreadsheetId: record.googleSheetId,
+            range: `${record.sheetName}!${startCol}${record.sheetRowNumber}:${lastCol}${record.sheetRowNumber}`,
+          });
+          const cells = rowRes.data.values?.[0] || [];
+          route.sheetHeaders.forEach((header, i) => {
+            rowMap[header] = cells[i]?.trim() || '';
+          });
+        } catch (_) {}
+      }
+
+      // Pre-resolve {{Sheet Header}} placeholders before passing to OpenAI.
+      const preResolvedBody = resolveSheetPlaceholders(route.autoReplyFollowUp.bodyText, rowMap);
+
+      const sendingAccountName = await fetchSendingAccountName(record.emailAccount, instantlyApiKey);
+
+      const personalized = await personalizeAutoReply(
+        { text: preResolvedBody },
+        { email_account: record.emailAccount, lead_email: record.lead_email, reply_subject: record.replySubject || '' },
+        null,
+        sendingAccountName,
+        openaiClient,
+        { link: route.autoReplyFollowUp.link || '' }
+      );
+
+      await awaitRateLimit();
+      const res = await axios.post(
+        'https://api.instantly.ai/api/v2/emails/reply',
+        {
+          eaccount:      record.emailAccount,
+          reply_to_uuid: record.replyEmailId,
+          subject:       record.replySubject || '',
+          body:          { html: personalized.html, text: personalized.text },
+        },
+        {
+          headers: {
+            Authorization:  `Bearer ${instantlyApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 15000,
+        }
+      );
+
+      await AutoReplyRecord.updateOne(
+        { _id: record._id },
+        { $inc: { followUpCount: 1 }, $set: { lastFollowUpAt: new Date() } }
+      );
+
+      console.log(chalk.green(`✅ [FollowUp] Sent to ${record.lead_email} (status: ${res.status})`));
+      sentCount++;
+    } catch (err) {
+      console.error(chalk.red(`❌ [FollowUp] Failed for ${record.lead_email}:`), err.response?.data || err.message);
+    }
+  }
+
+  if (sentCount > 0) {
+    console.log(chalk.green(`✅ [FollowUp] ${sentCount} follow-up(s) sent\n`));
+  } else {
+    console.log(chalk.gray(`   [FollowUp] No follow-ups due\n`));
   }
 }
 
@@ -1381,6 +1526,9 @@ async function processReply(reply) {
             googleSheetId,
             sheetName,
             sheetRowNumber: rowNumber,
+            emailAccount:   reply.email_account  || '',
+            replyEmailId:   reply.email_id        || '',
+            replySubject:   reply.reply_subject   || '',
           });
           console.log(chalk.gray(`   [AutoReplyRecord] Saved — row ${rowNumber}, lead: ${leadEmail}`));
         }
@@ -1675,7 +1823,11 @@ app.get('/check-sheet-headers', async (req, res) => {
 // =======================
 function startScheduler() {
   console.log(chalk.blue(`\n⏰ Scheduler: runs every ${SCHEDULER_INTERVAL_MINUTES} minute(s)`));
-  setInterval(processUnprocessedReplies, SCHEDULER_INTERVAL_MINUTES * 60 * 1000);
+  const intervalMs = SCHEDULER_INTERVAL_MINUTES * 60 * 1000;
+  setInterval(() => {
+    processUnprocessedReplies();
+    processAutoReplyFollowUps();
+  }, intervalMs);
 }
 
 // =======================
@@ -1733,6 +1885,7 @@ async function startServer() {
 
       console.log(chalk.blue('▶️  Running initial processing...'));
       processUnprocessedReplies();
+      processAutoReplyFollowUps();
     });
   } catch (error) {
     console.error(chalk.red('Failed to start server:'), error);

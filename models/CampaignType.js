@@ -95,6 +95,33 @@ const CampaignTypeSchema = new mongoose.Schema({
     },
   },
 
+  // Scheduled follow-up sent to leads who never replied to the auto-reply.
+  // Uses a separate email template from autoReply.
+  autoReplyFollowUp: {
+    enabled: {
+      type: Boolean,
+      default: false,
+    },
+    // Hours to wait after the auto-reply (or last follow-up) before sending.
+    intervalHours: {
+      type: Number,
+      default: 24,
+    },
+    // Maximum number of follow-up emails to send per lead.
+    maxFollowUps: {
+      type: Number,
+      default: 1,
+    },
+    bodyText: {
+      type: String,
+      default: '',
+    },
+    link: {
+      type: String,
+      default: '',
+    },
+  },
+
   // When enabled, the system checks if any of requiredFields are blank after
   // encoding a lead. If so, it sends a follow-up via Instantly asking for
   // the missing data. When the lead replies, the existing sheet row is updated

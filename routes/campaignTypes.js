@@ -66,7 +66,7 @@ router.post('/', async (req, res) => {
 // PUT /api/campaign-types/:id
 router.put('/:id', async (req, res) => {
   try {
-    const allowed = ['name', 'sheetName', 'emailTemplate', 'sheetHeaders', 'manualColCount', 'addressMapping', 'isActive', 'autoReply', 'dataRequestFollowUp'];
+    const allowed = ['name', 'sheetName', 'emailTemplate', 'sheetHeaders', 'manualColCount', 'addressMapping', 'isActive', 'autoReply', 'dataRequestFollowUp', 'replyPlaybook', 'callback'];
     const update = Object.fromEntries(
       Object.entries(req.body).filter(([k]) => allowed.includes(k))
     );

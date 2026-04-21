@@ -21,10 +21,16 @@ const ReplySchema = new mongoose.Schema(
     email_id: String,
     display_name: String,
 
-    // ✅ NEW FIELD
     isProcessed: {
       type: Boolean,
       default: false,
+      index: true,
+    },
+
+    replyType: {
+      type: String,
+      enum: ['fresh', 'auto_reply_response', 'data_fill_response'],
+      default: 'fresh',
       index: true,
     },
   },

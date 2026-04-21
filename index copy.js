@@ -934,31 +934,23 @@ async function classifyReplyWithPlaybook(replyText, playbook, openaiClient) {
     (playbook.auto_reply_blocked || []).map(s => s.toLowerCase())
   );
 
-  // Build lookup map for validation and label correction: category_id → { label, subs: Map<sub_variant_id, label> }
-  const categoryMap = new Map();
-  for (const cat of (playbook.categories || [])) {
-    const subMap = new Map(cat.sub_variants.map(sv => [sv.id, sv.label]));
-    categoryMap.set(cat.id, { label: cat.label, subs: subMap });
-  }
-
-  const categoryList = [...categoryMap.entries()]
-    .map(([id, { label, subs }]) => {
-      const subLines = [...subs.entries()].map(([sid, slabel]) => `    • ${sid}: ${slabel}`).join('\n');
-      return `${id} — ${label}\n${subLines}`;
-    })
+  const extractionRules = (playbook.categories || [])
+    .map(cat => `- ${cat.id} → extract the key signal for "${cat.label}" in 5–10 words`)
     .join('\n');
 
-  const prompt = `Classify this sales reply into exactly one category and sub-variant, then extract the key signal.
+  const prompt = `You are a reply classification assistant for an outbound sales campaign.
 
-CATEGORIES:
-${categoryList}
+Classify the lead's reply using the playbook below. Select exactly one category and one sub-variant that best fits the reply. Then extract the single most relevant piece of data from the reply for the chosen category.
 
-REPLY:
+PLAYBOOK:
+${JSON.stringify(playbook, null, 2)}
+
+LEAD'S REPLY:
 ${replyText}
 
-EXTRACTION:
-- If category is stated_amount: extract the exact dollar figure or range only (e.g. "$20k", "$10k–$15k"). Do not add other context.
-- All other categories: extract the most relevant signal in 5–10 words, never copy verbatim. Use null if nothing to extract.
+EXTRACTION RULES:
+Never copy the reply verbatim. Summarize in 5–10 words max. Use null if nothing relevant.
+${extractionRules}
 
 Return ONLY valid JSON:
 {
@@ -966,8 +958,8 @@ Return ONLY valid JSON:
   "sub_variant_id": "...",
   "category_label": "...",
   "sub_variant_label": "...",
-  "extracted": { "value": "concise detail or null" },
-  "reasoning": "one sentence"
+  "extracted": { "value": "concise extracted detail or null" },
+  "reasoning": "one sentence explaining the classification"
 }`;
 
   return withRetry(async () => {
@@ -982,19 +974,6 @@ Return ONLY valid JSON:
     });
 
     const result = JSON.parse(response.choices[0].message.content);
-
-    // Validate category_id and sub_variant_id against the playbook
-    const catEntry = categoryMap.get(result.category_id);
-    if (!catEntry) {
-      throw new Error(`Invalid category_id "${result.category_id}" — not in playbook`);
-    }
-    if (!catEntry.subs.has(result.sub_variant_id)) {
-      throw new Error(`Invalid sub_variant_id "${result.sub_variant_id}" for category "${result.category_id}"`);
-    }
-
-    // Override labels from the playbook so GPT can't return IDs as labels
-    result.category_label = catEntry.label;
-    result.sub_variant_label = catEntry.subs.get(result.sub_variant_id);
 
     // Derive auto_reply_allowed from the blocked list
     const compositeKey = `${result.category_id}__${result.sub_variant_id}`.toLowerCase();
@@ -1047,8 +1026,6 @@ async function dispatchFollowUpCallback(callbackUrl, reply, classification, shee
       headers: { 'Content-Type': 'application/json' },
       timeout: 15000,
     });
-    console.log("payload")
-    console.log(payload)
     console.log(chalk.green(`✅ [Callback] POST ${callbackUrl} → ${res.status}`));
     return true;
   } catch (err) {

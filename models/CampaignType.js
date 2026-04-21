@@ -155,6 +155,28 @@ const CampaignTypeSchema = new mongoose.Schema({
     },
   },
 
+  // Reply classification playbook — JSON object defining categories and sub-variants.
+  // When set, incoming follow-up replies are classified by OpenAI using this playbook
+  // before the result is included in the outbound callback POST.
+  // Set to null to disable classification for this campaign type.
+  replyPlaybook: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
+
+  // Outbound callback — POST processed follow-up reply data to an external system.
+  // Toggle enabled per campaign type without changing the URL.
+  callback: {
+    enabled: {
+      type: Boolean,
+      default: false,
+    },
+    url: {
+      type: String,
+      default: '',
+    },
+  },
+
   isActive: {
     type: Boolean,
     default: true,

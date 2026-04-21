@@ -41,6 +41,8 @@ export async function hydrateRouteCache() {
       autoReply:              ct.autoReply,
       autoReplyFollowUp:      ct.autoReplyFollowUp,
       dataRequestFollowUp:    ct.dataRequestFollowUp,
+      replyPlaybook:          ct.replyPlaybook   || null,
+      callback:               ct.callback,
       googleSheetId:          tenant.googleSheetId,
       tenantCredentials:      tenant.credentials,
       tenantSettings:         tenant.settings,

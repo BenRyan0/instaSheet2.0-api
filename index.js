@@ -1047,8 +1047,6 @@ async function dispatchFollowUpCallback(callbackUrl, reply, classification, shee
       headers: { 'Content-Type': 'application/json' },
       timeout: 15000,
     });
-    console.log("payload")
-    console.log(payload)
     console.log(chalk.green(`✅ [Callback] POST ${callbackUrl} → ${res.status}`));
     return true;
   } catch (err) {
@@ -1451,7 +1449,8 @@ async function handleAutoReplyResponse(reply, rowNumber, route, openaiClient, sh
 
     // Step 4: Read the full sheet row and POST to external system before marking processed.
     // If the callback is enabled and fails, leave the reply unprocessed so it retries next run.
-    if (route.callback?.enabled && route.callback?.url) {
+    // Skip if the AutoReplyRecord is already resolved — callback was already sent on a prior run.
+    if (route.callback?.enabled && route.callback?.url && !autoReplyRecord?.isResolved) {
       const startCol = columnLetter(manualColCount + 1);
       const lastCol  = columnLetter(manualColCount + sheetHeaders.length);
       let sheetRowMap = {};

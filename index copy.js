@@ -13,8 +13,6 @@ import {
   getAllRoutes,
 } from './services/routingService.js';
 import Reply from './models/Reply.js';
-import DataRequest from './models/DataRequest.js';
-import AutoReplyRecord from './models/AutoReplyRecord.js';
 import tenantRoutes from './routes/tenants.js';
 import campaignTypeRoutes from './routes/campaignTypes.js';
 import campaignRoutes from './routes/campaigns.js';
@@ -65,7 +63,7 @@ function clearSheetEmailCache() {
 
 async function hydrateEmailCache(sheetKey, sheetName, googleSheetId, sheetsClient, manualColCount, headers) {
   if (sheetEmailCache[sheetKey]) return;
-  sheetEmailCache[sheetKey] = new Map();
+  sheetEmailCache[sheetKey] = new Set();
 
   try {
     const lastCol = columnLetter(manualColCount + headers.length);
@@ -83,7 +81,7 @@ async function hydrateEmailCache(sheetKey, sheetName, googleSheetId, sheetsClien
 
     for (let i = 1; i < rows.length; i++) {
       const email = rows[i][emailColIndex];
-      if (email) sheetEmailCache[sheetKey].set(email.toLowerCase().trim(), i + 1); // i+1 = 1-based sheet row
+      if (email) sheetEmailCache[sheetKey].add(email.toLowerCase().trim());
     }
 
     console.log(chalk.gray(`   [Cache] "${sheetName}" — loaded ${sheetEmailCache[sheetKey].size} known emails`));
@@ -98,15 +96,10 @@ function isEmailInCache(sheetKey, email) {
   return cache ? cache.has(email.toLowerCase().trim()) : false;
 }
 
-function getRowFromCache(sheetKey, email) {
-  if (!email) return null;
-  return sheetEmailCache[sheetKey]?.get(email.toLowerCase().trim()) ?? null;
-}
-
-function addEmailToCache(sheetKey, email, rowNumber) {
+function addEmailToCache(sheetKey, email) {
   if (!email) return;
-  if (!sheetEmailCache[sheetKey]) sheetEmailCache[sheetKey] = new Map();
-  sheetEmailCache[sheetKey].set(email.toLowerCase().trim(), rowNumber ?? null);
+  if (!sheetEmailCache[sheetKey]) sheetEmailCache[sheetKey] = new Set();
+  sheetEmailCache[sheetKey].add(email.toLowerCase().trim());
 }
 
 // =======================
@@ -684,31 +677,6 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
     const allRows = fullRangeRes.data.values || [];
     const nextRow = allRows.length + 1;
 
-    // Extend the sheet if nextRow would exceed the current grid row limit.
-    const metaRes = await sheetsClient.spreadsheets.get({
-      spreadsheetId: googleSheetId,
-      fields: 'sheets.properties',
-    });
-    const sheetProps = metaRes.data.sheets?.find(s => s.properties.title === sheetName);
-    const currentRowCount = sheetProps?.properties?.gridProperties?.rowCount ?? 1000;
-    if (nextRow > currentRowCount) {
-      const rowsToAdd = Math.max(200, nextRow - currentRowCount + 1);
-      console.log(chalk.yellow(`   [SheetExtend] "${sheetName}" at row limit (${currentRowCount}) — adding ${rowsToAdd} rows`));
-      await sheetsClient.spreadsheets.batchUpdate({
-        spreadsheetId: googleSheetId,
-        requestBody: {
-          requests: [{
-            appendDimension: {
-              sheetId: sheetProps.properties.sheetId,
-              dimension: 'ROWS',
-              length: rowsToAdd,
-            },
-          }],
-        },
-      });
-      console.log(chalk.green(`   [SheetExtend] "${sheetName}" extended to ${currentRowCount + rowsToAdd} rows`));
-    }
-
     const targetRange = `${sheetName}!${startCol}${nextRow}:${lastCol}${nextRow}`;
 
     await sheetsClient.spreadsheets.values.update({
@@ -718,7 +686,7 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
       requestBody: { values: [rowArray] },
     });
     console.log(chalk.green(`✅ Row ${nextRow} written to "${sheetName}" (${startCol}–${lastCol})\n`));
-    return nextRow;
+    return true;
   }, `Sheet append (${sheetName})`);
 }
 
@@ -729,15 +697,9 @@ async function appendToSheet(sheetName, enrichedData, manualColCount, headers, s
 // =======================
 function plainTextToHtml(text) {
   if (!text) return '';
-  const urlRegex = /(https?:\/\/[^\s<>"]+)/g;
   return text
     .split(/\n\n+/)
-    .map(para =>
-      `<p>${para
-        .replace(/\n/g, '<br>')
-        .replace(urlRegex, '<a href="$1">$1</a>')
-      }</p>`
-    )
+    .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
     .join('\n');
 }
 
@@ -777,15 +739,13 @@ async function fetchSendingAccountName(emailAccount, instantlyApiKey) {
   }
 }
 
-async function personalizeAutoReply(template, replyData, instantlyData, sendingAccountName, openaiClient, templateVars = {}) {
+async function personalizeAutoReply(template, replyData, instantlyData, sendingAccountName, openaiClient) {
   const leadContext = {
     company_name:        replyData.company_name  || instantlyData?.payload?.company || '',
     sendingAccountName:  sendingAccountName       || '',
-    firstName:           instantlyData?.first_name || replyData.display_name?.split(' ')[0] || '',
-    link:                templateVars.link         || '',
   };
 
-  console.log(chalk.gray(` [Auto-reply] leadContext → company_name: "${leadContext.company_name}", sendingAccountName: "${leadContext.sendingAccountName}", firstName: "${leadContext.firstName}", link: "${leadContext.link}"`));
+  console.log(chalk.gray(` [Auto-reply] leadContext → company_name: "${leadContext.company_name}", sendingAccountName: "${leadContext.sendingAccountName}"`));
 
   const prompt = `You are an email personalization assistant. Replace every placeholder in the plain text template below using the rules and data provided. Do not change any other wording.
 
@@ -796,14 +756,6 @@ PLACEHOLDER RULES:
 
 2. {{sendingAccountName}}
    - Use sendingAccountName directly — it has already been resolved.
-
-3. {{firstName}}
-   - Use firstName directly.
-   - If empty, leave blank (do not invent a name).
-
-4. {{link}}
-   - Use link directly (it is a URL).
-   - If empty, leave blank (do not invent a URL).
 
 LEAD DATA:
 ${JSON.stringify(leadContext, null, 2)}
@@ -816,9 +768,7 @@ Return ONLY valid JSON:
   "text": "personalized plain text here",
   "resolved": {
     "Company Name": "value used",
-    "sendingAccountName": "value used",
-    "firstName": "value used",
-    "link": "value used"
+    "sendingAccountName": "value used"
   }
 }`;
 
@@ -834,7 +784,7 @@ Return ONLY valid JSON:
     });
     const result = JSON.parse(response.choices[0].message.content);
     if (result.resolved) {
-      console.log(chalk.gray(`   [Auto-reply] Resolved → Company Name: "${result.resolved['Company Name']}" | Sender: "${result.resolved['sendingAccountName']}" | First Name: "${result.resolved['firstName']}" | Link: "${result.resolved['link']}"`));
+      console.log(chalk.gray(`   [Auto-reply] Resolved → Company Name: "${result.resolved['Company Name']}" | Sender: "${result.resolved['sendingAccountName']}"`));
     }
     const html = plainTextToHtml(result.text);
     console.log(chalk.gray(`   [Auto-reply] Generated HTML from plain text (${html.length} chars)`));
@@ -865,8 +815,7 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
       reply,
       instantlyData,
       sendingAccountName,
-      openaiClient,
-      { link: autoReply.link || '' }
+      openaiClient
     );
 
     const autoReplyPayload = {
@@ -891,7 +840,7 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
           Authorization:  `Bearer ${instantlyApiKey}`,
           'Content-Type': 'application/json',
         },
-        timeout: 15000,
+        timeout: 30000,
       }
     );
 
@@ -908,575 +857,9 @@ async function sendInstantlyAutoReply(reply, autoReply, instantlyData, instantly
 }
 
 // =======================
-// Sheet Placeholder Resolver
-// Replaces {{Header Name}} tokens in a template string with values from a
-// header→value map built from the lead's sheet row. Tokens that don't match
-// any header are left as-is so personalizeAutoReply can handle them.
-// =======================
-function resolveSheetPlaceholders(template, rowMap) {
-  return template.replace(/\{\{([^}]+)\}\}/g, (match, key) => {
-    const trimmed = key.trim();
-    return trimmed in rowMap ? (rowMap[trimmed] || '') : match;
-  });
-}
-
-// =======================
-// Reply Classification — Lunalend Playbook
-// Classifies an incoming follow-up reply against a campaign's replyPlaybook.
-// Returns category_id, sub_variant_id, whether auto-reply is allowed, extracted
-// data relevant to the category, and a brief reasoning string.
-// Returns null if no playbook is configured or classification fails.
-// =======================
-async function classifyReplyWithPlaybook(replyText, playbook, openaiClient) {
-  if (!playbook || !replyText) return null;
-
-  const blockedSet = new Set(
-    (playbook.auto_reply_blocked || []).map(s => s.toLowerCase())
-  );
-
-  const extractionRules = (playbook.categories || [])
-    .map(cat => `- ${cat.id} → extract the key signal for "${cat.label}" in 5–10 words`)
-    .join('\n');
-
-  const prompt = `You are a reply classification assistant for an outbound sales campaign.
-
-Classify the lead's reply using the playbook below. Select exactly one category and one sub-variant that best fits the reply. Then extract the single most relevant piece of data from the reply for the chosen category.
-
-PLAYBOOK:
-${JSON.stringify(playbook, null, 2)}
-
-LEAD'S REPLY:
-${replyText}
-
-EXTRACTION RULES:
-Never copy the reply verbatim. Summarize in 5–10 words max. Use null if nothing relevant.
-${extractionRules}
-
-Return ONLY valid JSON:
-{
-  "category_id": "...",
-  "sub_variant_id": "...",
-  "category_label": "...",
-  "sub_variant_label": "...",
-  "extracted": { "value": "concise extracted detail or null" },
-  "reasoning": "one sentence explaining the classification"
-}`;
-
-  return withRetry(async () => {
-    const response = await openaiClient.chat.completions.create({
-      model: 'gpt-4.1',
-      messages: [
-        { role: 'system', content: 'You are a precise reply classification assistant. Return only valid JSON.' },
-        { role: 'user', content: prompt },
-      ],
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-    });
-
-    const result = JSON.parse(response.choices[0].message.content);
-
-    // Derive auto_reply_allowed from the blocked list
-    const compositeKey = `${result.category_id}__${result.sub_variant_id}`.toLowerCase();
-    result.auto_reply_allowed = !blockedSet.has(compositeKey);
-
-    console.log(chalk.cyan(`   [Classification] ${result.category_id} / ${result.sub_variant_id} — auto_reply_allowed: ${result.auto_reply_allowed}`));
-    console.log(chalk.gray(`   [Classification] Reasoning: ${result.reasoning}`));
-    if (result.extracted) {
-      console.log(chalk.gray(`   [Classification] Extracted: ${JSON.stringify(result.extracted)}`));
-    }
-
-    return result;
-  }, 'OpenAI reply classification');
-}
-
-// =======================
-// Follow-Up Callback — POST processed follow-up reply data to external system
-// Payload: reply DB fields + classification result + full sheet row data.
-// Non-blocking — a failure never stops processing.
-// =======================
-async function dispatchFollowUpCallback(callbackUrl, reply, classification, sheetRowMap, meta) {
-  if (!callbackUrl) return;
-
-  const payload = {
-    replyData: {
-      lead_email:    reply.lead_email,
-      email_account: reply.email_account,
-      email_id:      reply.email_id,
-      campaign_id:   reply.campaign_id,
-      campaign_name: reply.campaign_name,
-      display_name:  reply.display_name,
-      reply_subject: reply.reply_subject,
-      reply_text:    reply.reply_text_snippet || reply.reply_text || '',
-      replyType:     'auto_reply_response',
-      createdAt:     reply.createdAt,
-    },
-    classification: classification || null,
-    sheetData:      sheetRowMap,
-    meta: {
-      tenantName:     meta.tenantName,
-      campaignType:   meta.campaignType,
-      sheetName:      meta.sheetName,
-      sheetRowNumber: meta.sheetRowNumber,
-      processedAt:    new Date().toISOString(),
-    },
-  };
-
-  try {
-    const res = await axios.post(callbackUrl, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    });
-    console.log(chalk.green(`✅ [Callback] POST ${callbackUrl} → ${res.status}`));
-    return true;
-  } catch (err) {
-    console.error(chalk.red(`❌ [Callback] POST failed (${callbackUrl}): ${err.response?.status || err.message}`));
-    return false;
-  }
-}
-
-// =======================
-// Auto-Reply Follow-Up Scheduler
-// Runs on every scheduler tick. Finds AutoReplyRecords where the lead has not
-// replied and the configured interval has elapsed, then sends a follow-up email
-// using the campaignType's separate autoReplyFollowUp template.
-// =======================
-async function processAutoReplyFollowUps() {
-  const pendingRecords = await AutoReplyRecord.find({ isResolved: false });
-  if (pendingRecords.length === 0) return;
-
-  console.log(chalk.blue(`\n📨 [FollowUp] Checking ${pendingRecords.length} pending auto-reply record(s)...`));
-
-  let sentCount = 0;
-
-  for (const record of pendingRecords) {
-    const route = getRouteForCampaign(record.campaign_id);
-    if (!route?.autoReplyFollowUp?.enabled) continue;
-
-    const { intervalHours = 24, maxFollowUps = 1 } = route.autoReplyFollowUp;
-
-    if (record.followUpCount >= maxFollowUps) continue;
-
-    const lastTime = record.lastFollowUpAt || record.createdAt;
-    const hoursSince = (Date.now() - new Date(lastTime).getTime()) / (1000 * 60 * 60);
-    if (hoursSince < intervalHours) continue;
-
-    if (!record.emailAccount || !record.replyEmailId) {
-      console.log(chalk.yellow(`⚠️ [FollowUp] Skipping ${record.lead_email} — missing emailAccount or replyEmailId`));
-      continue;
-    }
-
-    console.log(chalk.cyan(`✉️  [FollowUp] ${record.lead_email} — ${record.followUpCount + 1}/${maxFollowUps} (${hoursSince.toFixed(1)}h since last contact)`));
-
-    try {
-      const instantlyApiKey = route.tenantCredentials.instantlyApiKey;
-      const openaiClient    = getOpenAIClient(route.tenantCredentials.openAiApiKey);
-      const { sheets }      = await getGoogleClients(route.tenantCredentials.googleServiceAccountJson);
-
-      // Read the full lead row from the sheet and build a header→value map.
-      // This allows any sheet column to be used as a {{Placeholder}} in the template.
-      const rowMap = {};
-      if (record.sheetRowNumber && route.sheetHeaders.length) {
-        const startCol = columnLetter(route.manualColCount + 1);
-        const lastCol  = columnLetter(route.manualColCount + route.sheetHeaders.length);
-        try {
-          const rowRes = await sheets.spreadsheets.values.get({
-            spreadsheetId: record.googleSheetId,
-            range: `${record.sheetName}!${startCol}${record.sheetRowNumber}:${lastCol}${record.sheetRowNumber}`,
-          });
-          const cells = rowRes.data.values?.[0] || [];
-          route.sheetHeaders.forEach((header, i) => {
-            rowMap[header] = cells[i]?.trim() || '';
-          });
-        } catch (_) {}
-      }
-
-      // Pre-resolve {{Sheet Header}} placeholders before passing to OpenAI.
-      const preResolvedBody = resolveSheetPlaceholders(route.autoReplyFollowUp.bodyText, rowMap);
-
-      const sendingAccountName = await fetchSendingAccountName(record.emailAccount, instantlyApiKey);
-
-      const personalized = await personalizeAutoReply(
-        { text: preResolvedBody },
-        { email_account: record.emailAccount, lead_email: record.lead_email, reply_subject: record.replySubject || '' },
-        null,
-        sendingAccountName,
-        openaiClient,
-        { link: route.autoReplyFollowUp.link || '' }
-      );
-
-      await awaitRateLimit();
-      const res = await axios.post(
-        'https://api.instantly.ai/api/v2/emails/reply',
-        {
-          eaccount:      record.emailAccount,
-          reply_to_uuid: record.replyEmailId,
-          subject:       record.replySubject || '',
-          body:          { html: personalized.html, text: personalized.text },
-        },
-        {
-          headers: {
-            Authorization:  `Bearer ${instantlyApiKey}`,
-            'Content-Type': 'application/json',
-          },
-          timeout: 15000,
-        }
-      );
-
-      await AutoReplyRecord.updateOne(
-        { _id: record._id },
-        { $inc: { followUpCount: 1 }, $set: { lastFollowUpAt: new Date() } }
-      );
-
-      console.log(chalk.green(`✅ [FollowUp] Sent to ${record.lead_email} (status: ${res.status})`));
-      sentCount++;
-    } catch (err) {
-      console.error(chalk.red(`❌ [FollowUp] Failed for ${record.lead_email}:`), err.response?.data || err.message);
-    }
-  }
-
-  if (sentCount > 0) {
-    console.log(chalk.green(`✅ [FollowUp] ${sentCount} follow-up(s) sent\n`));
-  } else {
-    console.log(chalk.gray(`   [FollowUp] No follow-ups due\n`));
-  }
-}
-
-// =======================
-// Data-Request Follow-Up — Extract missing fields from a follow-up reply
-// =======================
-async function extractMissingFieldsFromReply(replyText, requestedFields, openaiClient, context = {}) {
-  const { dataRequestBodyText = '', companyName = '', displayName = '' } = context;
-
-  const fieldRules = {
-    'Phone From Reply':        'Phone number — format as (XXX) XXX-XXXX. Return null if not found.',
-    'Insurance Provider':      'Insurance provider name (e.g. "UnitedHealth", "Blue Cross", "Humana"). Return null if not mentioned.',
-    'Medicare Advantage':      '"Yes" if lead has Medicare Advantage, "No" if they do not, null if unclear.',
-    'Medicare Advantage Type': 'Plan type — "HMO", "PPO", or another plan type if stated. Return null if not mentioned.',
-    'Medicaid':                '"Yes" if lead has Medicaid, "No" if they do not, null if unclear.',
-  };
-
-  const unknownFallback = dataRequestBodyText
-    ? 'Based on the data-request email above, find this field\'s value in the reply. Return null if not clearly stated.'
-    : 'Extract from reply text. Return null if not found.';
-
-  const instructions = requestedFields
-    .map(f => `  "${f}": ${fieldRules[f] || unknownFallback}`)
-    .join('\n');
-
-  const jsonShape = JSON.stringify(
-    Object.fromEntries(requestedFields.map(f => [f, '...'])),
-    null, 2
-  );
-
-  const contextSection = dataRequestBodyText
-    ? `CONTEXT — WHAT WE ASKED THE LEAD:
-${dataRequestBodyText}
-
-LEAD CONTEXT:
-- Name: ${displayName || 'Unknown'}
-- Company: ${companyName || 'Unknown'}
-
-`
-    : '';
-
-  const prompt = `You are extracting specific data fields from a lead's reply to a follow-up email.
-
-${contextSection}LEAD'S REPLY:
-${replyText}
-
-FIELDS TO EXTRACT:
-${instructions}
-
-Return ONLY valid JSON matching this exact shape (null for any field not found):
-${jsonShape}`;
-
-  return withRetry(async () => {
-    const response = await openaiClient.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: 'You are a precise data extraction assistant. You have full context of what was asked and what the lead replied. Return only valid JSON.' },
-        { role: 'user', content: prompt },
-      ],
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-    });
-    return JSON.parse(response.choices[0].message.content);
-  }, 'OpenAI missing fields extraction');
-}
-
-// =======================
-// Data-Request Follow-Up — Update specific cells in an existing sheet row
-// =======================
-async function updateSheetCells(sheetName, rowNumber, fieldUpdates, manualColCount, sheetHeaders, sheetsClient, googleSheetId) {
-  const updates = Object.entries(fieldUpdates).filter(([, v]) => v !== null && v !== undefined && v !== '');
-
-  if (updates.length === 0) {
-    console.log(chalk.yellow('   [DataFill] No non-empty values to write'));
-    return;
-  }
-
-  for (const [field, value] of updates) {
-    const colIndex = sheetHeaders.indexOf(field);
-    if (colIndex === -1) {
-      console.log(chalk.yellow(`   [DataFill] Field "${field}" not in sheetHeaders — skipping`));
-      continue;
-    }
-    const col = columnLetter(manualColCount + 1 + colIndex);
-    const range = `${sheetName}!${col}${rowNumber}`;
-    await sheetsClient.spreadsheets.values.update({
-      spreadsheetId: googleSheetId,
-      range,
-      valueInputOption: 'RAW',
-      requestBody: { values: [[String(value)]] },
-    });
-    console.log(chalk.green(`   [SheetWrite] ${col}${rowNumber} "${field}" ← "${value}"`));
-  }
-}
-
-// =======================
-// Data-Request Follow-Up — Send follow-up email asking for missing fields
-// =======================
-async function sendDataRequestFollowUp(reply, route, missingFields, rowNumber, instantlyApiKey, openaiClient) {
-  const { dataRequestFollowUp, googleSheetId, sheetName, tenantCredentials } = route;
-
-  if (!reply.email_id) {
-    console.log(chalk.yellow('⚠️ Data-request follow-up skipped — no email_id on reply'));
-    return;
-  }
-  if (!reply.email_account) {
-    console.log(chalk.yellow('⚠️ Data-request follow-up skipped — no email_account on reply'));
-    return;
-  }
-
-  // Guard: prevent sending a duplicate data-request follow-up.
-  // Check 1 — same lead + campaign (any email): broad guard regardless of resolved status.
-  // Check 2 — same email_id + campaign + lead: exact dedup for the specific reply that triggered this.
-  const alreadySent = await DataRequest.findOne({
-    $or: [
-      { lead_email: reply.lead_email, campaign_id: reply.campaign_id },
-      { replyEmailId: reply.email_id, campaign_id: reply.campaign_id, lead_email: reply.lead_email },
-    ],
-  });
-  if (alreadySent) {
-    console.log(chalk.gray(`   [DataRequest] Follow-up already sent for ${reply.lead_email} (email_id: ${reply.email_id}) — skipping`));
-    return;
-  }
-
-  console.log(chalk.cyan(`📋 Sending data-request follow-up for ${reply.lead_email} — missing: ${missingFields.join(', ')}`));
-
-  try {
-    const sendingAccountName = await fetchSendingAccountName(reply.email_account, instantlyApiKey);
-
-    const personalized = await personalizeAutoReply(
-      { text: dataRequestFollowUp.bodyText },
-      reply,
-      null,
-      sendingAccountName,
-      openaiClient,
-      { link: dataRequestFollowUp.link || '' }
-    );
-
-    const payload = {
-      eaccount:      reply.email_account,
-      reply_to_uuid: reply.email_id,
-      subject:       reply.reply_subject,
-      body:          { html: personalized.html, text: personalized.text },
-    };
-
-    await awaitRateLimit();
-    const res = await axios.post(
-      'https://api.instantly.ai/api/v2/emails/reply',
-      payload,
-      {
-        headers: {
-          Authorization:  `Bearer ${instantlyApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 15000,
-      }
-    );
-
-    console.log(chalk.green(`✅ Data-request follow-up sent to ${reply.lead_email} (status: ${res.status})`));
-
-    await DataRequest.create({
-      lead_email:      reply.lead_email,
-      campaign_id:     reply.campaign_id,
-      googleSheetId,
-      sheetName,
-      sheetRowNumber:  rowNumber,
-      requestedFields: missingFields,
-      emailAccount:    reply.email_account,
-      replyEmailId:    reply.email_id,
-    });
-
-    console.log(chalk.green(`✅ DataRequest saved — row ${rowNumber}, fields: ${missingFields.join(', ')}`));
-  } catch (err) {
-    console.error(chalk.red(`❌ Data-request follow-up failed for ${reply.lead_email}:`), err.response?.data || err.message);
-  }
-}
-
-// =======================
-// Data-Request Follow-Up — Handle a lead's reply to our data-request email
-// =======================
-async function handleDataFillReply(reply, pendingRequest, route, openaiClient, sheetsClient) {
-  const { sheetName, sheetHeaders, manualColCount, googleSheetId } = route;
-  const leadEmail = reply.lead_email;
-
-  console.log(chalk.cyan(`\n📋 [DataFill] Handling data-fill reply from ${leadEmail}`));
-  console.log(chalk.gray(`   Updating row ${pendingRequest.sheetRowNumber} in "${sheetName}"`));
-  console.log(chalk.gray(`   Fields requested: ${pendingRequest.requestedFields.join(', ')}`));
-
-  try {
-    const replyText = reply.reply_text_snippet || reply.reply_text || '';
-
-    const extracted = await extractMissingFieldsFromReply(replyText, pendingRequest.requestedFields, openaiClient, {
-      dataRequestBodyText: route.dataRequestFollowUp?.bodyText || '',
-      companyName:         reply.company_name || '',
-      displayName:         reply.display_name || '',
-    });
-    console.log(chalk.gray(`   Extracted: ${JSON.stringify(extracted)}`));
-
-    await updateSheetCells(
-      sheetName,
-      pendingRequest.sheetRowNumber,
-      extracted,
-      manualColCount,
-      sheetHeaders,
-      sheetsClient,
-      googleSheetId
-    );
-
-    const priorityField = route.dataRequestFollowUp?.priorityField || '';
-    const priorityMet   = priorityField && extracted[priorityField];
-
-    // Always mark the reply as processed — we've handled it regardless of outcome.
-    await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'data_fill_response' } });
-
-    if (!priorityField || priorityMet) {
-      // Resolve when: no priority field is configured (original behaviour),
-      // OR the priority field was provided by the lead.
-      await DataRequest.updateOne({ _id: pendingRequest._id }, { $set: { isResolved: true } });
-      console.log(chalk.green(`✅ [DataFill] Row ${pendingRequest.sheetRowNumber} resolved — ${leadEmail}`));
-
-
-    } else {
-      // Priority field was not provided — leave DataRequest open so the lead
-      // can reply again and another attempt will be made.
-      console.log(chalk.yellow(`⏳ [DataFill] Priority field "${priorityField}" not found — DataRequest stays open for ${leadEmail}`));
-    }
-
-    return true;
-  } catch (err) {
-    console.error(chalk.red(`❌ [DataFill] Failed for ${leadEmail}:`), err.message);
-    return false;
-  }
-}
-
-// =======================
-// Auto-Reply Follow-Up — Handle a lead's reply to our auto-reply email
-// Runs eligibility analysis on the new reply and updates key cells in the
-// existing sheet row. Does not create a duplicate row.
-// =======================
-async function handleAutoReplyResponse(reply, rowNumber, route, openaiClient, sheetsClient, autoReplyRecord = null) {
-  const { sheetName, sheetHeaders, manualColCount, googleSheetId, campaignType } = route;
-  const leadEmail = reply.lead_email;
-
-  console.log(chalk.cyan(`\n📨 [AutoReplyResponse] Handling follow-up reply from ${leadEmail}`));
-  console.log(chalk.gray(`   Updating row ${rowNumber} in "${sheetName}"`));
-
-  try {
-    const replyText = reply.reply_text_snippet || reply.reply_text || '';
-
-    // Step 1: Classify and extract using the campaign's reply playbook
-    const classification = await classifyReplyWithPlaybook(replyText, route.replyPlaybook, openaiClient);
-
-    // Step 2: Read the current Details cell so we can append rather than overwrite.
-    let currentDetails = '';
-    if (sheetHeaders.includes('Details')) {
-      const detailsColIndex = sheetHeaders.indexOf('Details');
-      const detailsCol = columnLetter(manualColCount + 1 + detailsColIndex);
-      try {
-        const cellRes = await sheetsClient.spreadsheets.values.get({
-          spreadsheetId: googleSheetId,
-          range: `${sheetName}!${detailsCol}${rowNumber}`,
-        });
-        currentDetails = cellRes.data.values?.[0]?.[0] || '';
-      } catch (_) {}
-    }
-
-    // Build Details: reply text + classification summary appended
-    const classificationSuffix = classification
-      ? `\nCATEGORY:${classification.category_id}/${classification.sub_variant_id} | ${JSON.stringify(classification.extracted)}`
-      : '';
-
-    const appendedDetails = currentDetails
-      ? `REPLY:${replyText}${classificationSuffix}\n${currentDetails}`
-      : `REPLY:${replyText}${classificationSuffix}`;
-
-    // Step 3: Write only the Details cell — classification owns this update
-    if (sheetHeaders.includes('Details')) {
-      await updateSheetCells(
-        sheetName,
-        rowNumber,
-        { 'Details': appendedDetails },
-        manualColCount,
-        sheetHeaders,
-        sheetsClient,
-        googleSheetId
-      );
-    }
-
-    // Step 4: Read the full sheet row and POST to external system before marking processed.
-    // If the callback is enabled and fails, leave the reply unprocessed so it retries next run.
-    if (route.callback?.enabled && route.callback?.url) {
-      const startCol = columnLetter(manualColCount + 1);
-      const lastCol  = columnLetter(manualColCount + sheetHeaders.length);
-      let sheetRowMap = {};
-      try {
-        const rowRes = await sheetsClient.spreadsheets.values.get({
-          spreadsheetId: googleSheetId,
-          range: `${sheetName}!${startCol}${rowNumber}:${lastCol}${rowNumber}`,
-        });
-        const cells = rowRes.data.values?.[0] || [];
-        sheetHeaders.forEach((header, i) => {
-          sheetRowMap[header] = cells[i]?.trim() || '';
-        });
-      } catch (err) {
-        console.warn(chalk.yellow(`⚠️ [Callback] Could not read sheet row ${rowNumber}: ${err.message}`));
-      }
-
-      const callbackOk = await dispatchFollowUpCallback(
-        route.callback.url,
-        reply,
-        classification,
-        sheetRowMap,
-        { tenantName: route.tenantName, campaignType, sheetName, sheetRowNumber: rowNumber }
-      );
-
-      if (!callbackOk) {
-        console.log(chalk.yellow(`⏭️ [AutoReplyResponse] Callback failed — reply NOT marked processed, will retry: ${leadEmail}`));
-        return false;
-      }
-    }
-
-    // Step 5: Mark reply processed and resolve the AutoReplyRecord
-    await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'auto_reply_response' } });
-    if (autoReplyRecord) {
-      await AutoReplyRecord.updateOne({ _id: autoReplyRecord._id }, { $set: { isResolved: true } });
-    }
-
-    console.log(chalk.green(`✅ [AutoReplyResponse] Row ${rowNumber} updated — ${leadEmail}`));
-
-    return true;
-  } catch (err) {
-    console.error(chalk.red(`❌ [AutoReplyResponse] Failed for ${leadEmail}:`), err.message);
-    return false;
-  }
-}
-
-// =======================
 // Instantly — Update Lead Interest Status
 // =======================
+
 async function updateInstantlyInterest(leadEmail, instantlyApiKey, interestValue = 60) {
   if (!leadEmail) return false;
   try {
@@ -1545,45 +928,10 @@ async function processReply(reply) {
   console.log('='.repeat(60));
 
   try {
-    // Step 0a: Data-fill intercept — check for a pending DataRequest before the
-    // dedup cache, because the lead's follow-up reply has the same email+campaign
-    // as the original and would otherwise be silently skipped.
-    const pendingRequest = await DataRequest.findOne({
-      lead_email:  leadEmail,
-      campaign_id: reply.campaign_id,
-      isResolved:  false,
-    });
-    if (pendingRequest) {
-      console.log(chalk.cyan(`📋 [DataFill] Pending DataRequest found for ${leadEmail} — routing to data-fill handler`));
-      return handleDataFillReply(reply, pendingRequest, route, openaiClient, sheets);
-    }
-
-    // Step 0b: Auto-reply response intercept — check for a pending AutoReplyRecord
-    // before the dedup cache so follow-up replies to our auto-reply are analyzed
-    // and written back to the existing sheet row instead of being dropped.
-    const pendingAutoReply = await AutoReplyRecord.findOne({
-      lead_email:  leadEmail,
-      campaign_id: reply.campaign_id,
-      isResolved:  false,
-    });
-    if (pendingAutoReply) {
-      console.log(chalk.cyan(`📨 [AutoReplyResponse] Pending AutoReplyRecord found for ${leadEmail} — routing to auto-reply response handler`));
-      return handleAutoReplyResponse(reply, pendingAutoReply.sheetRowNumber, route, openaiClient, sheets, pendingAutoReply);
-    }
-
-    // Step 0c: Pre-flight duplicate check (fast in-memory cache).
-    // If autoReply is enabled and we know the row, treat this as a follow-up
-    // reply response instead of dropping it.
+    // Step 0: Pre-flight duplicate check (fast in-memory cache)
     if (isEmailInCache(sheetKey, leadEmail)) {
-      if (autoReply?.enabled) {
-        const cachedRow = getRowFromCache(sheetKey, leadEmail);
-        if (cachedRow) {
-          console.log(chalk.cyan(`📨 [AutoReplyResponse] Follow-up reply detected via cache for ${leadEmail} (row ${cachedRow}) — routing to auto-reply response handler`));
-          return handleAutoReplyResponse(reply, cachedRow, route, openaiClient, sheets);
-        }
-      }
       console.log(chalk.yellow(`⏭️ Skipping — already in sheet "${sheetName}": ${leadEmail}`));
-      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
+      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
       return false;
     }
 
@@ -1599,7 +947,7 @@ async function processReply(reply) {
     if (!eligibilityAnalysis.isInterested) {
       console.log(chalk.yellow('⏭️ Skipping — no interest detected'));
       console.log(chalk.gray(`   Reason: ${eligibilityAnalysis.reasoning}`));
-      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
+      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
       return false;
     }
 
@@ -1628,50 +976,22 @@ async function processReply(reply) {
     // Step 5: Race-condition duplicate guard
     if (isEmailInCache(sheetKey, leadEmail)) {
       console.log(chalk.yellow(`⏭️ Skipping — duplicate detected just before write: ${leadEmail}`));
-      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
+      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
       return false;
     }
 
     // Step 6: Write to Google Sheet
-    const rowNumber = await appendToSheet(sheetName, enrichedData, manualColCount, sheetHeaders, sheets, googleSheetId);
+    const appended = await appendToSheet(sheetName, enrichedData, manualColCount, sheetHeaders, sheets, googleSheetId);
 
-    if (rowNumber) {
-      addEmailToCache(sheetKey, leadEmail, rowNumber);
-
-      // Data-request follow-up — send if configured and required fields are blank.
-      const drConfig = route.dataRequestFollowUp;
-      if (drConfig?.enabled && drConfig.requiredFields?.length) {
-        if (enrichedData['Phone From Reply']) {
-          console.log(chalk.gray('   [DataRequest] Phone From Reply already filled — skipping follow-up'));
-        } else {
-          const missingFields = drConfig.requiredFields.filter(f => !enrichedData[f]);
-          if (missingFields.length > 0) {
-            await sendDataRequestFollowUp(reply, route, missingFields, rowNumber, instantlyApiKey, openaiClient);
-          } else {
-            console.log(chalk.gray('   [DataRequest] All required fields present — no follow-up needed'));
-          }
-        }
-      }
+    if (appended) {
+      addEmailToCache(sheetKey, leadEmail);
 
       // Auto-reply step — only runs when enabled on the campaign type.
       if (autoReply?.enabled) {
-        const autoReplySent = await sendInstantlyAutoReply(reply, autoReply, instantlyData, instantlyApiKey, openaiClient);
-        if (autoReplySent) {
-          await AutoReplyRecord.create({
-            lead_email:     leadEmail,
-            campaign_id:    reply.campaign_id,
-            googleSheetId,
-            sheetName,
-            sheetRowNumber: rowNumber,
-            emailAccount:   reply.email_account  || '',
-            replyEmailId:   reply.email_id        || '',
-            replySubject:   reply.reply_subject   || '',
-          });
-          console.log(chalk.gray(`   [AutoReplyRecord] Saved — row ${rowNumber}, lead: ${leadEmail}`));
-        }
+        await sendInstantlyAutoReply(reply, autoReply, instantlyData, instantlyApiKey, openaiClient);
       }
 
-      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
+      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true } });
       await updateInstantlyInterest(leadEmail, instantlyApiKey, 56);
       console.log(chalk.green(`✅ Reply fully processed: ${leadEmail} → "${sheetName}"`));
       return true;
@@ -1840,7 +1160,7 @@ async function processUnprocessedReplies() {
 // Management API Routes
 // =======================
 app.use('/api/tenants', tenantRoutes);
-app.use('/api/campaign-types', campaignTypeRoutes);
+app.use('campaign-types/campaign-types', campaignTypeRoutes);
 app.use('/api/campaigns', campaignRoutes);
 
 // =======================
@@ -1911,7 +1231,6 @@ app.post('/refresh-routes', async (req, res) => {
   }
 });
 
-
 app.get('/check-sheet-headers', async (req, res) => {
   const { sheetName } = req.query;
   if (!sheetName) {
@@ -1960,11 +1279,7 @@ app.get('/check-sheet-headers', async (req, res) => {
 // =======================
 function startScheduler() {
   console.log(chalk.blue(`\n⏰ Scheduler: runs every ${SCHEDULER_INTERVAL_MINUTES} minute(s)`));
-  const intervalMs = SCHEDULER_INTERVAL_MINUTES * 60 * 1000;
-  setInterval(() => {
-    processUnprocessedReplies();
-    processAutoReplyFollowUps();
-  }, intervalMs);
+  setInterval(processUnprocessedReplies, SCHEDULER_INTERVAL_MINUTES * 60 * 1000);
 }
 
 // =======================
@@ -2022,7 +1337,6 @@ async function startServer() {
 
       console.log(chalk.blue('▶️  Running initial processing...'));
       processUnprocessedReplies();
-      processAutoReplyFollowUps();
     });
   } catch (error) {
     console.error(chalk.red('Failed to start server:'), error);

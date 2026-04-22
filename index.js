@@ -970,6 +970,9 @@ Return ONLY valid JSON:
   "reasoning": "one sentence"
 }`;
 
+// console.log(chalk.cyan('🤖 Classifying reply against playbook with OpenAI...'));
+// console.log(prompt)
+
   return withRetry(async () => {
     const response = await openaiClient.chat.completions.create({
       model: 'gpt-4.1',
@@ -981,7 +984,9 @@ Return ONLY valid JSON:
       response_format: { type: 'json_object' },
     });
 
+    // console.log(response)
     const result = JSON.parse(response.choices[0].message.content);
+    // console.log(result)
 
     // Validate category_id and sub_variant_id against the playbook
     const catEntry = categoryMap.get(result.category_id);
@@ -1434,21 +1439,10 @@ async function handleAutoReplyResponse(reply, rowNumber, route, openaiClient, sh
       ? `REPLY:${replyText}${classificationSuffix}\n${currentDetails}`
       : `REPLY:${replyText}${classificationSuffix}`;
 
-    // Step 3: Write only the Details cell — classification owns this update
-    if (sheetHeaders.includes('Details')) {
-      await updateSheetCells(
-        sheetName,
-        rowNumber,
-        { 'Details': appendedDetails },
-        manualColCount,
-        sheetHeaders,
-        sheetsClient,
-        googleSheetId
-      );
-    }
-
-    // Step 4: Read the full sheet row and POST to external system before marking processed.
-    // If the callback is enabled and fails, leave the reply unprocessed so it retries next run.
+    // Step 3: If callback is enabled, POST first before writing to the sheet.
+    // This ensures a failed callback (e.g. 500) never results in a partial sheet write
+    // that can't be retried cleanly. The built appendedDetails is injected directly into
+    // the payload so the callback receives the updated value even before the sheet is written.
     // Skip if the AutoReplyRecord is already resolved — callback was already sent on a prior run.
     if (route.callback?.enabled && route.callback?.url && !autoReplyRecord?.isResolved) {
       const startCol = columnLetter(manualColCount + 1);
@@ -1467,6 +1461,11 @@ async function handleAutoReplyResponse(reply, rowNumber, route, openaiClient, sh
         console.warn(chalk.yellow(`⚠️ [Callback] Could not read sheet row ${rowNumber}: ${err.message}`));
       }
 
+      // Inject the pending Details update so the callback sees the latest value.
+      if (sheetHeaders.includes('Details')) {
+        sheetRowMap['Details'] = appendedDetails;
+      }
+
       const callbackOk = await dispatchFollowUpCallback(
         route.callback.url,
         reply,
@@ -1476,9 +1475,22 @@ async function handleAutoReplyResponse(reply, rowNumber, route, openaiClient, sh
       );
 
       if (!callbackOk) {
-        console.log(chalk.yellow(`⏭️ [AutoReplyResponse] Callback failed — reply NOT marked processed, will retry: ${leadEmail}`));
+        console.log(chalk.yellow(`⏭️ [AutoReplyResponse] Callback failed — reply NOT marked processed, sheet NOT written, will retry: ${leadEmail}`));
         return false;
       }
+    }
+
+    // Step 4: Write the Details cell — only reached if callback succeeded (or is disabled).
+    if (sheetHeaders.includes('Details')) {
+      await updateSheetCells(
+        sheetName,
+        rowNumber,
+        { 'Details': appendedDetails },
+        manualColCount,
+        sheetHeaders,
+        sheetsClient,
+        googleSheetId
+      );
     }
 
     // Step 5: Mark reply processed and resolve the AutoReplyRecord
@@ -1589,25 +1601,28 @@ async function processReply(reply) {
       isResolved:  false,
     });
     if (pendingAutoReply) {
-      console.log(chalk.cyan(`📨 [AutoReplyResponse] Pending AutoReplyRecord found for ${leadEmail} — routing to auto-reply response handler`));
+      console.log(chalk.cyan(`📨 [AutoReplyResponse] Pending AutoReplyRecord found for ${leadEmail} — routing to auto-reply response handler 1`));
       return handleAutoReplyResponse(reply, pendingAutoReply.sheetRowNumber, route, openaiClient, sheets, pendingAutoReply);
     }
+    console.log("No pending DataRequest or AutoReplyRecord found — proceeding with normal processing flow")
 
     // Step 0c: Pre-flight duplicate check (fast in-memory cache).
     // If autoReply is enabled and we know the row, treat this as a follow-up
     // reply response instead of dropping it.
-    if (isEmailInCache(sheetKey, leadEmail)) {
-      if (autoReply?.enabled) {
-        const cachedRow = getRowFromCache(sheetKey, leadEmail);
-        if (cachedRow) {
-          console.log(chalk.cyan(`📨 [AutoReplyResponse] Follow-up reply detected via cache for ${leadEmail} (row ${cachedRow}) — routing to auto-reply response handler`));
-          return handleAutoReplyResponse(reply, cachedRow, route, openaiClient, sheets);
-        }
-      }
-      console.log(chalk.yellow(`⏭️ Skipping — already in sheet "${sheetName}": ${leadEmail}`));
-      await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
-      return false;
-    }
+    // if (isEmailInCache(sheetKey, leadEmail)) {
+    //   if (autoReply?.enabled) {
+    //     console.log(autoReply)
+    //     console.log("autoReply")
+    //     const cachedRow = getRowFromCache(sheetKey, leadEmail);
+    //     if (cachedRow) {
+    //       console.log(chalk.cyan(`📨 [AutoReplyResponse] Follow-up reply detected via cache for ${leadEmail} (row ${cachedRow}) — routing to auto-reply response handler`));
+    //       return handleAutoReplyResponse(reply, cachedRow, route, openaiClient, sheets);
+    //     }
+    //   }
+    //   console.log(chalk.yellow(`⏭️ Skipping — already in sheet "${sheetName}": ${leadEmail}`));
+    //   await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
+    //   return false;
+    // }
 
     // Step 1: Analyze reply
     const eligibilityAnalysis = await analyzeReplyEligibility(
@@ -1688,6 +1703,12 @@ async function processReply(reply) {
             emailAccount:   reply.email_account  || '',
             replyEmailId:   reply.email_id        || '',
             replySubject:   reply.reply_subject   || '',
+            firstName:      instantlyData?.first_name
+                              || reply.display_name?.split(' ')[0]
+                              || '',
+            companyName:    reply.company_name
+                              || instantlyData?.payload?.company_name
+                              || '',
           });
           console.log(chalk.gray(`   [AutoReplyRecord] Saved — row ${rowNumber}, lead: ${leadEmail}`));
         }

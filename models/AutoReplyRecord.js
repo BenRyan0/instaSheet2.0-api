@@ -55,6 +55,18 @@ const AutoReplyRecordSchema = new mongoose.Schema({
     default: '',
   },
 
+  // Lead's first name — resolved from Instantly at create time.
+  firstName: {
+    type: String,
+    default: '',
+  },
+
+  // Lead's company name — sourced from the reply payload at create time.
+  companyName: {
+    type: String,
+    default: '',
+  },
+
   // How many scheduled follow-ups have been sent so far.
   followUpCount: {
     type: Number,

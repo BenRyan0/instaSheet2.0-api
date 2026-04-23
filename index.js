@@ -1,6 +1,8 @@
 import express from 'express';
 import axios from 'axios';
 import mongoose from 'mongoose';
+import fs from 'fs';
+import path from 'path';
 import chalk from 'chalk';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
@@ -324,10 +326,11 @@ LEAD'S REPLY:
 ${replyText}
 
 INTEREST LEVEL — choose one based on the campaign criteria you extracted:
-- "high"   : Lead answered one or more qualifying questions, provided requested information, shared their situation, asked specific follow-up questions about the offer, or expressed clear readiness to move forward.
-- "medium" : Lead showed curiosity or partial engagement — asked a vague question about the offer, gave a non-committal positive, or provided incomplete answers.
-- "low"    : Lead acknowledged the email but made no commitment and provided nothing useful (e.g., "I'll think about it", "send me more info" with no other context).
-- "none"   : Lead explicitly opted out ("no", "not interested", "remove me", "unsubscribe", "stop", "do not contact", "pass", "discontinue"), OR confirmed they definitively lack a qualification the email required.
+- "high"     : Lead answered one or more qualifying questions, provided requested information, shared their situation, asked specific follow-up questions about the offer, or expressed clear readiness to move forward.
+- "medium"   : Lead showed curiosity or partial engagement — asked a vague question about the offer, gave a non-committal positive, or provided incomplete answers.
+- "low"      : Lead acknowledged the email but made no commitment and provided nothing useful (e.g., "I'll think about it", "send me more info" with no other context).
+- "none"     : Lead politely opted out ("no", "not interested", "remove me", "unsubscribe", "stop", "do not contact", "pass", "discontinue"), OR confirmed they definitively lack a qualification the email required.
+- "hard_no"  : Lead is rude, hostile, or aggressively dismissive — uses aggressive language, insults, all-caps demands, threats, or expresses anger/frustration while asking to be removed (e.g., "STOP EMAILING ME", "this is spam and harassment", "remove me NOW", explicit profanity directed at the sender). Distinct from "none" which covers calm, polite opt-outs.
 
 ELIGIBILITY — based solely on what qualifies someone according to this email:
 - "Likely Eligible"      : Lead confirmed or strongly implied they meet the qualifying criteria for this offer.
@@ -349,7 +352,7 @@ OUTPUT — return ONLY valid JSON, no other text:
     "disqualifyingSignals": ["what disinterest/ineligibility looks like"]
   },
   "isInterested": true | false,
-  "interestLevel": "high" | "medium" | "low" | "none",
+  "interestLevel": "high" | "medium" | "low" | "none" | "hard_no",
   "reasoning": "1–2 sentences referencing the specific offer and what the lead said",
   "keyPhrases": ["exact phrases from the reply that drove the decision"],
   "phoneFromReply": "(XXX) XXX-XXXX" | null,
@@ -1534,6 +1537,22 @@ async function updateInstantlyInterest(leadEmail, instantlyApiKey, interestValue
 }
 
 // =======================
+// Hard-No CSV Logger
+// =======================
+const HARD_NO_CSV_PATH = path.join(process.cwd(), 'hard_no_leads.csv');
+
+function appendHardNoToCSV(leadEmail, replyText) {
+  const escape = (val) => `"${String(val || '').replace(/"/g, '""')}"`;
+  const needsHeader = !fs.existsSync(HARD_NO_CSV_PATH);
+  if (needsHeader) {
+    fs.appendFileSync(HARD_NO_CSV_PATH, 'lead_email,reply_text,timestamp\n', 'utf8');
+  }
+  const row = `${escape(leadEmail)},${escape(replyText)},${escape(new Date().toISOString())}\n`;
+  fs.appendFileSync(HARD_NO_CSV_PATH, row, 'utf8');
+  console.log(chalk.red(`   [HardNo] Logged to hard_no_leads.csv: ${leadEmail}`));
+}
+
+// =======================
 // Main Processing Function — Single Reply
 // =======================
 // Per-tenant locks — each tenant's replies run sequentially but tenants run
@@ -1636,6 +1655,9 @@ async function processReply(reply) {
     if (!eligibilityAnalysis.isInterested) {
       console.log(chalk.yellow('⏭️ Skipping — no interest detected'));
       console.log(chalk.gray(`   Reason: ${eligibilityAnalysis.reasoning}`));
+      if (eligibilityAnalysis.interestLevel === 'hard_no') {
+        appendHardNoToCSV(leadEmail, reply.reply_text_snippet || reply.reply_text || '');
+      }
       await Reply.updateOne({ _id: reply._id }, { $set: { isProcessed: true, replyType: 'fresh' } });
       return false;
     }
